@@ -6,6 +6,7 @@
 #include <mcap/recording_traits.hpp>
 #include <oxr_utils/oxr_funcs.hpp>
 #include <schema/full_body_bfbs_generated.h>
+#include <schema/serialized.hpp>
 #include <schema/timestamp_generated.h>
 
 #include <cassert>
@@ -23,9 +24,9 @@ std::unique_ptr<FullBodyMcapChannels> LiveFullBodyTrackerPicoImpl::create_mcap_c
                                                                                         std::string_view base_name)
 {
     return std::make_unique<FullBodyMcapChannels>(
-        writer, base_name, FullBodyPicoRecordingTraits::schema_name,
-        std::vector<std::string>(FullBodyPicoRecordingTraits::recording_channels.begin(),
-                                 FullBodyPicoRecordingTraits::recording_channels.end()));
+        writer, base_name, FullBodyRecordingTraits::schema_name,
+        std::vector<std::string>(
+            FullBodyRecordingTraits::recording_channels.begin(), FullBodyRecordingTraits::recording_channels.end()));
 }
 
 LiveFullBodyTrackerPicoImpl::LiveFullBodyTrackerPicoImpl(const OpenXRSessionHandles& handles,
@@ -58,7 +59,7 @@ LiveFullBodyTrackerPicoImpl::LiveFullBodyTrackerPicoImpl(const OpenXRSessionHand
         }
         if (!body_tracking_props.supportsBodyTracking)
         {
-            std::cerr << "[FullBodyTrackerPico] Body tracking not supported by this system, running in limp mode"
+            std::cerr << "[FullBodyTracker] Body tracking not supported by this system, running in limp mode"
                       << std::endl;
             return;
         }
@@ -85,7 +86,7 @@ LiveFullBodyTrackerPicoImpl::LiveFullBodyTrackerPicoImpl(const OpenXRSessionHand
         throw std::runtime_error("Failed to create body tracker: " + std::to_string(result));
     }
 
-    std::cout << "FullBodyTrackerPico initialized (24 joints)" << std::endl;
+    std::cout << "FullBodyTracker initialized (24 joints)" << std::endl;
 }
 
 LiveFullBodyTrackerPicoImpl::~LiveFullBodyTrackerPicoImpl()
@@ -100,12 +101,14 @@ LiveFullBodyTrackerPicoImpl::~LiveFullBodyTrackerPicoImpl()
 
 void LiveFullBodyTrackerPicoImpl::update(int64_t monotonic_time_ns)
 {
+    // Invalidate first, publish last: the encode below is the only writer, so no exit path
+    // can leave a caller reading last frame's joints.
+    tracked_.reset();
     last_update_time_ = monotonic_time_ns;
 
     if (body_tracker_ == XR_NULL_HANDLE)
     {
         // Policy: limp mode (feature unsupported/unavailable) is non-fatal.
-        tracked_.data.reset();
         return;
     }
 
@@ -126,21 +129,12 @@ void LiveFullBodyTrackerPicoImpl::update(int64_t monotonic_time_ns)
     XrResult result = pfn_locate_body_joints_(body_tracker_, &locate_info, &locations);
     if (XR_FAILED(result))
     {
-        tracked_.data.reset();
-        throw std::runtime_error("[FullBodyTrackerPico] xrLocateBodyJointsBD failed: " + std::to_string(result));
+        throw std::runtime_error("[FullBodyTracker] xrLocateBodyJointsBD failed: " + std::to_string(result));
     }
 
-    if (!tracked_.data)
-    {
-        tracked_.data = std::make_shared<FullBodyPosePicoT>();
-    }
-
-    tracked_.data->all_joint_poses_tracked = locations.allJointPosesTracked;
-
-    if (!tracked_.data->joints)
-    {
-        tracked_.data->joints = std::make_shared<BodyJointsPico>();
-    }
+    FullBodyPoseT data;
+    data.all_joint_poses_tracked = locations.allJointPosesTracked;
+    data.joints = std::make_shared<BodyJoints>();
 
     for (uint32_t i = 0; i < XR_BODY_JOINT_COUNT_BD; ++i)
     {
@@ -155,17 +149,14 @@ void LiveFullBodyTrackerPicoImpl::update(int64_t monotonic_time_ns)
                         (joint_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
 
         BodyJointPose joint_pose(pose, is_valid);
-        tracked_.data->joints->mutable_joints()->Mutate(i, joint_pose);
+        data.joints->mutable_joints()->Mutate(i, joint_pose);
     }
 
-    if (mcap_channels_)
-    {
-        DeviceDataTimestamp timestamp(last_update_time_, last_update_time_, xr_time);
-        mcap_channels_->write(0, timestamp, tracked_.data);
-    }
+    const DeviceDataTimestamp timestamp(last_update_time_, last_update_time_, xr_time);
+    tracked_ = publish_and_record(mcap_channels_.get(), 0, timestamp, &data);
 }
 
-const FullBodyPosePicoTrackedT& LiveFullBodyTrackerPicoImpl::get_body_pose() const
+const Serialized<FullBodyPose>& LiveFullBodyTrackerPicoImpl::get_body_pose() const
 {
     return tracked_;
 }

@@ -13,10 +13,47 @@ commands to the terminal.
    :depth: 1
    :backlinks: none
 
+.. _try-on-brev:
+
+Try It on Brev — Zero Setup
+---------------------------
+
+Experience **Isaac Teleop** remote teleoperation with no local install. Brev provisions the
+server side — CloudXR runtime, retargeting pipeline, and an
+`Isaac Lab <https://developer.nvidia.com/isaac/lab>`__ simulation — on a cloud GPU.
+Just grab the instance IP and connect from your headset.
+
+.. note::
+
+   **Server (Brev):** CloudXR + Isaac Teleop retargeting + Isaac Lab sim on a cloud GPU.
+
+   **Client (you):** open the `Isaac Teleop Web Client`_
+   in your headset or browser, enter the Brev instance IP, accept the certificate, and click
+   **Connect** — see step :ref:`connect-xr-headset`.
+
+   Isaac Teleop is not limited to simulation; it drives real robots and ROS 2 pipelines too.
+
+.. grid:: 2
+   :gutter: 2
+
+   .. grid-item-card:: Launch on Brev — Isaac Lab 2.3
+      :link: https://brev.nvidia.com/launchable/deploy?launchableID=env-3B3ETyweD8hOcZfNzaE12cnGNBq
+      :link-type: url
+
+      Stable
+
+   .. grid-item-card:: Launch on Brev — Isaac Lab 3.0 beta 1
+      :link: https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3B2jdZR8Ct0vQCzwseLuOZXoMyk
+      :link-type: url
+
+      Latest · recommended upgrade path
+
+----
+
 .. _check-out-code-base:
 
-1. Check out code base (Optional)
-----------------------------------
+1. Check out code base (for examples)
+-------------------------------------
 
 Clone the repository and enter the project directory:
 
@@ -33,133 +70,110 @@ to clone the repository for a couple quick samples to run.
 2. Install the ``isaacteleop`` pip package
 -------------------------------------------
 
-In a new terminal, activate your preferred virtual or conda environment, then install the package
-from PyPI (or from a local wheel if you built from source):
+In a new terminal, activate your preferred virtual or conda environment, then install the latest
+stable release from PyPI:
 
 .. code-block:: bash
 
-   # From PyPI
-   pip install 'isaacteleop[cloudxr,retargeters]~=1.0.0' --extra-index-url https://pypi.nvidia.com
+   pip install 'isaacteleop[cloudxr,retargeters]~=1.0'
+
+Pre-release builds are published between stable releases. Picking one up takes the NVIDIA index
+and an opt-in to pre-release versions — shown here with `uv <https://docs.astral.sh/uv/>`__:
+
+.. code-block:: bash
+
+   uv pip install 'isaacteleop[cloudxr,retargeters]~=1.0' \
+         --extra-index-url https://pypi.nvidia.com --prerelease=allow
+
+The two commands above track the newest 1.x release. To follow this version of the documentation
+(|version|) exactly, pin to the series it describes instead:
+
+.. parsed-literal::
+
+   uv pip install 'isaacteleop[cloudxr,retargeters]\ |pip_version_pin|\ ' \\
+         --extra-index-url https://pypi.nvidia.com --prerelease=allow
 
 Instead of installing the package from PyPI, you can build from source and install the local wheel.
 See :doc:`build_from_source/index` for more details.
 
-.. dropdown:: ARM64 / aarch64 only (e.g. NVIDIA DGX Spark)
-
-   PyPI does not publish pre-built ``nlopt`` wheels for ARM64, so the ``retargeters`` extra cannot
-   be installed directly from PyPI
-   (see `issue #452 <https://github.com/NVIDIA/IsaacTeleop/issues/452>`_). Follow the
-   :ref:`aarch64 nlopt wheel build steps <aarch64-nlopt-wheel>` from the build-from-source guide
-   first, then install ``isaacteleop`` with an additional ``--find-links``:
-
-   .. code-block:: bash
-
-      pip install 'isaacteleop[cloudxr,retargeters]~=1.0.0' \
-          --extra-index-url https://pypi.nvidia.com \
-          --find-links=/tmp/nlopt-wheels/
-
 .. _run-cloudxr-server:
 
-3. Run CloudXR Server
----------------------
+3. Configure CloudXR (optional)
+-------------------------------
 
-Start the CloudXR runtime. The first run downloads the CloudXR Web Client SDK
-and asks you to review and accept the EULA:
+The teleop examples in this guide bring CloudXR up for you when they connect —
+you do **not** need to start the runtime in a separate terminal or source any
+environment file. If nothing is serving yet, the example starts a CloudXR
+service in the background and prints how to stop it; that service outlives the
+example, so the headset stays connected from one run to the next.
+The first launch downloads the CloudXR Web Client SDK and asks you to review and
+accept the EULA on the terminal; answer the prompt once and the acceptance is
+remembered for subsequent runs.
+
+.. TODO: ``Quest3`` is the profile every WebXR client uses — Quest, PICO, and the
+   desktop-browser IWER emulator — so the name reads as a hardware restriction it
+   does not impose. Either rename the profile or add a generic alias (e.g.
+   ``webxr``) in the runtime, then update the default and the values listed below.
+
+The CloudXR runtime uses the ``Quest3`` device profile by default. The name is
+narrower than the profile: ``Quest3`` serves every WebXR client — Quest, PICO,
+and the desktop-browser IWER emulator — so PICO users should keep it. Apple
+Vision Pro connects natively and needs ``auto-native`` instead; the default is
+not derived from the connected headset, so set it yourself. The profile is set
+on the *runtime*, so applications inherit whatever the runtime they connect to
+was started with. To override it, or any other setting, write a ``KEY=value``
+env file and start the service with it:
 
 .. code-block:: bash
 
-   python -m isaacteleop.cloudxr
+   echo 'NV_DEVICE_PROFILE=auto-native' > custom.env
+   python -m isaacteleop.cloudxr.service start --cloudxr-env-config ./custom.env
 
-To bypass the interactive EULA prompt (e.g. for CI or headless runs), pass the flag:
+The same ``--cloudxr-env-config`` flag is available on the teleop examples under
+``examples/teleop/python/``, which register CloudXR's launcher arguments through
+``CloudXRLauncher.add_launcher_arguments()`` — but it applies only when the
+example is the one starting the runtime. With a service already running the
+example attaches to it instead, and prints which settings it had to ignore (see
+:doc:`/references/cloudxr`). (The ROS 2 example takes the equivalent
+``cloudxr_env_config`` ROS parameter instead.)
+To inspect the resolved settings after startup:
 
 .. code-block:: bash
 
-   python -m isaacteleop.cloudxr --accept-eula
+   cat ~/.cloudxr/run/cloudxr.env
 
-.. dropdown:: Optional launch modes
+.. note::
 
-   The launcher supports three optional flags that can be combined to control
-   how the headset connects and how the web client is delivered.
+   To manage the service yourself — check what is running, stop it, or use
+   launch modes like ``--host-client`` and ``--setup-oob`` — see
+   :doc:`/references/cloudxr`.
 
-   .. list-table::
-      :header-rows: 1
-      :widths: 45 55
+.. list-table:: Environment variables
+   :header-rows: 1
+   :widths: 25 15 35 25
 
-      * - Command
-        - What it does
-      * - ``python -m isaacteleop.cloudxr``
-        - Plain: headset navigates to GitHub Pages URL over WiFi.
-      * - ``python -m isaacteleop.cloudxr --host-client``
-        - Serves the web client at ``https://<ip>:48322/client/`` via the WSS
-          proxy. No separate port, no USB or TURN relay required. Useful when
-          GitHub Pages is unreachable.
-      * - ``python -m isaacteleop.cloudxr --setup-oob``
-        - OOB hub + CDP automation: opens the browser on the headset and
-          auto-clicks CONNECT over USB adb. Client URL is GitHub Pages.
-      * - ``python -m isaacteleop.cloudxr --setup-oob --host-client``
-        - OOB hub + CDP with client at ``/client/`` on the WSS proxy
-          (air-gapped / proxy use).
-      * - ``python -m isaacteleop.cloudxr --setup-oob --usb-local``
-        - All traffic over USB: adb-reverse + coturn TURN relay + loopback
-          HTTPS. Requires ``coturn`` and a WiFi-associated headset.
+   * - Variable
+     - Default
+     - Description
+     - Values
+   * - ``NV_DEVICE_PROFILE``
+     - ``Quest3``
+     - Device profile
+     - ``auto-webrtc``, ``auto-native``, ``Quest3``, ``AppleVisionPro``
+   * - ``NV_CXR_ENABLE_PUSH_DEVICES``
+     - ``true``
+     - Push device overseer for hand tracking
+     - ``true``, ``false``
+   * - ``NV_CXR_FILE_LOGGING``
+     - ``true``
+     - File-based logging (disable to print to console)
+     - ``true``, ``false``
 
-   ``--usb-local`` requires ``--setup-oob``.  See
-   :doc:`/references/oob_teleop_control` for full OOB documentation.
-
-You should see output similar to:
-
-.. figure:: ../_static/cloudxr-run-output.png
-   :alt: CloudXR run output
-   :align: center
-
-   **Figure:** CloudXR run output
-
-.. important::
-
-   Keep this terminal open — CloudXR must stay running for the duration of the session. Open a
-   **new terminal** for the remaining steps.
-
-   Also take note of the ``source /home/dev/.cloudxr/run/cloudxr.env`` path it mentioned in the
-   output. You will need to source it in step :ref:`load-cloudxr-environment-variables`.
-
-.. dropdown:: CloudXR configurations (optional)
-
-   The CloudXR runtime uses the ``auto-webrtc`` device profile by default (Pico & Quest). For
-   Apple Vision Pro it defaults to ``auto-native``.
-
-   To inspect the active settings after startup:
-
-   .. code-block:: bash
-
-      cat ~/.cloudxr/run/cloudxr.env
-
-   To override settings, create an env file and pass it at startup:
-
-   .. code-block:: bash
-
-      echo 'NV_DEVICE_PROFILE=auto-native' > custom.env
-      python -m isaacteleop.cloudxr --cloudxr-env-config=./custom.env
-
-   .. list-table:: Environment variables
-      :header-rows: 1
-      :widths: 25 15 35 25
-
-      * - Variable
-        - Default
-        - Description
-        - Values
-      * - ``NV_DEVICE_PROFILE``
-        - ``auto-webrtc``
-        - Device profile
-        - ``auto-webrtc``, ``auto-native``, ``Quest3``, ``AppleVisionPro``
-      * - ``NV_CXR_ENABLE_PUSH_DEVICES``
-        - ``true``
-        - Push device overseer for hand tracking
-        - ``true``, ``false``
-      * - ``NV_CXR_FILE_LOGGING``
-        - ``true``
-        - File-based logging (disable to print to console)
-        - ``true``, ``false``
+On Jetson Orin the launcher selects the experimental CloudXR runtime and
+main-thread join automatically. You normally do not need to set
+``ISAAC_TELEOP_CLOUDXR_EXP`` or ``ISAAC_TELEOP_CLOUDXR_JOIN_MAIN``; those are
+overrides for debugging or forcing the stable path. See
+:doc:`/references/cloudxr`.
 
 .. _whitelist-firewall-ports:
 
@@ -210,7 +224,7 @@ running the CloudXR runtime and wss proxy in containerized environment; or using
    :open:
 
    No physical headset required for a quick test: open
-   `https://nvidia.github.io/IsaacTeleop/client <https://nvidia.github.io/IsaacTeleop/client>`__
+   `nvidia.github.io/IsaacTeleop/client`_
    in a **desktop browser** — IWER (Immersive Web Emulator Runtime) loads automatically and
    emulates a Meta Quest 3 headset.
 
@@ -237,10 +251,11 @@ running the CloudXR runtime and wss proxy in containerized environment; or using
 
    .. note::
 
-      If GitHub Pages is unreachable (corporate network, air-gapped machine), start the server with
-      ``--host-client`` in step :ref:`run-cloudxr-server` and open
-      ``https://<your-ip>:48322/client/`` instead of the GitHub Pages URL. Port 48322 is already
-      whitelisted in step :ref:`whitelist-firewall-ports`.
+      If GitHub Pages is unreachable (corporate network, air-gapped machine), you can serve the web
+      client locally from the CloudXR proxy and open ``https://<your-ip>:48322/client/`` instead of
+      the GitHub Pages URL. Port 48322 is already whitelisted in step
+      :ref:`whitelist-firewall-ports`. See :doc:`/references/oob_teleop_control` for how to serve the
+      client from the proxy.
 
    .. tab-set::
       .. tab-item:: CloudXR web client
@@ -273,6 +288,12 @@ running the CloudXR runtime and wss proxy in containerized environment; or using
       - Click the **Click https://<ip>:48322/ to accept cert** link that appears on the page.
       - In the new tab, you will see a **"Your connection is not private"** warning. Click **Advanced**, then **Proceed to <ip> (unsafe)**.
       - Once accepted, the page will show **Certificate Accepted**. Navigate back to the CloudXR.js client page.
+
+   .. important::
+
+      **Jetson Orin:** when the CloudXR runtime runs on Orin, set **Video Codec** to
+      **H.264** in the CloudXR web client.
+
    3. Click **Connect** to begin teleoperation.
 
    .. note::
@@ -307,28 +328,9 @@ running the CloudXR runtime and wss proxy in containerized environment; or using
       to connect to Isaac Teleop.
 
 
-.. _load-cloudxr-environment-variables:
-
-6. Load CloudXR environment variables
---------------------------------------
-
-Open a new terminal and source the CloudXR environment variables posted from the CloudXR runtime in
-:ref:`run-cloudxr-server`:
-
-Source the setup script so that the OpenXR runtime points to CloudXR:
-
-.. code-block:: bash
-
-   source ~/.cloudxr/run/cloudxr.env
-
-.. important::
-
-   Make sure to run the rest of the commands in the same terminal. Or if have to open a new
-   terminal, source the CloudXR environment variables again.
-
 .. _run-teleop-example:
 
-7. Run a teleop example
+6. Run a teleop example
 ------------------------
 
 Run the simplified gripper retargeting example. This demonstrates the full
@@ -392,11 +394,10 @@ Next steps
 
       **Teleoperation with Isaac ROS**
 
-      Check out the :code-dir:`examples/teleop_ros2/` directory for an example on how to make a
-      ROS 2 message publisher using Isaac Teleop.
-
-      We are also working on a Unitree G1-based end-to-end teleoperation, data collection, and
-      imitation learning solution for ROS2 in an upcoming `Isaac ROS`_ release. Stay tuned!
+      For a complete `Isaac ROS`_ pipeline, follow `Teleoperation with Isaac GR00T and Unitree G1`_
+      — an end-to-end workflow that combines Isaac Teleop, CloudXR, and ROS 2 to teleoperate a
+      Unitree G1 humanoid. You validate the setup in MuJoCo, then deploy on real hardware over a
+      Jetson AGX Thor, as a precursor to data collection and imitation learning.
 
       .. rst-class:: trademark-notice
 
@@ -420,3 +421,4 @@ More Information
 .. _`Teleoperation and Imitation Learning with Isaac Lab Mimic`: https://isaac-sim.github.io/IsaacLab/develop/source/overview/imitation-learning/teleop_imitation.html#teleoperation-imitation-learning
 .. _`CloudXR network setup`: https://docs.nvidia.com/cloudxr-sdk/latest/requirement/network_setup.html#ports-and-firewalls
 .. _`Isaac ROS`: https://nvidia-isaac-ros.github.io
+.. _`Teleoperation with Isaac GR00T and Unitree G1`: https://docs.nvidia.com/learning/physical-ai/gr00t-e2e-workflow/latest/real-robot-workflow/real-teleop.html

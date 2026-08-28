@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "generated_tracker_binding_includes.inc"
+
 #include <deviceio_trackers/controller_tracker.hpp>
-#include <deviceio_trackers/frame_metadata_tracker_oak.hpp>
-#include <deviceio_trackers/full_body_tracker_pico.hpp>
-#include <deviceio_trackers/generic_3axis_pedal_tracker.hpp>
+#include <deviceio_trackers/full_body_tracker.hpp>
 #include <deviceio_trackers/hand_tracker.hpp>
+#include <deviceio_trackers/haptic_command_reader_tracker.hpp>
 #include <deviceio_trackers/head_tracker.hpp>
-#include <deviceio_trackers/joint_state_tracker.hpp>
 #include <deviceio_trackers/message_channel_tracker.hpp>
 #include <deviceio_trackers/tensor_push_tracker.hpp>
 #include <pybind11/numpy.h>
@@ -17,13 +17,37 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <string_view>
 
 namespace py = pybind11;
 
+namespace
+{
+
+// Hand an encoded snapshot to Python, mapping "no payload" onto None.
+//
+// C++ spells absence as an empty handle, but exposing that to Python would make an
+// inactive device answer field reads with defaults -- a disconnected pedal would read
+// 0.0, indistinguishable from a pedal at rest. None makes the same mistake an
+// AttributeError instead, and is what the caller already tests for.
+template <typename T>
+py::object to_python(const core::Serialized<T>& handle)
+{
+    return handle ? py::cast(handle) : py::none();
+}
+
+} // namespace
+
+// Handing a snapshot to Python copies a shared_ptr to an immutable buffer, so there is no
+// payload clone on the read path and no aliasing of live tracker storage: what a caller
+// reads this frame keeps its values after the next session.update(), which publishes a new
+// buffer rather than refilling this one.
+
 PYBIND11_MODULE(_deviceio_trackers, m)
 {
-    // Load schema pybind converters (TrackedT / schema types) before exposing tracker accessors.
+    // Load schema pybind converters (the encoded table views) before exposing tracker accessors.
     py::module_::import("isaacteleop.schema._schema");
 
     m.doc() = "Isaac Teleop DeviceIO - Tracker classes";
@@ -36,35 +60,35 @@ PYBIND11_MODULE(_deviceio_trackers, m)
         .def(py::init<>())
         .def(
             "get_left_hand",
-            [](const core::HandTracker& self, const core::ITrackerSession& session) -> core::HandPoseTrackedT
-            { return self.get_left_hand(session); },
-            py::arg("session"))
+            [](const core::HandTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_left_hand(session)); },
+            py::arg("session"), "Get the left hand tracked state (None if inactive)")
         .def(
             "get_right_hand",
-            [](const core::HandTracker& self, const core::ITrackerSession& session) -> core::HandPoseTrackedT
-            { return self.get_right_hand(session); },
-            py::arg("session"));
+            [](const core::HandTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_right_hand(session)); },
+            py::arg("session"), "Get the right hand tracked state (None if inactive)");
 
     py::class_<core::HeadTracker, core::ITracker, std::shared_ptr<core::HeadTracker>>(m, "HeadTracker")
         .def(py::init<>())
         .def(
             "get_head",
-            [](const core::HeadTracker& self, const core::ITrackerSession& session) -> core::HeadPoseTrackedT
-            { return self.get_head(session); },
-            py::arg("session"));
+            [](const core::HeadTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_head(session)); },
+            py::arg("session"), "Get the head tracked state (None if inactive)");
 
     py::class_<core::ControllerTracker, core::ITracker, std::shared_ptr<core::ControllerTracker>>(m, "ControllerTracker")
         .def(py::init<>())
         .def(
             "get_left_controller",
-            [](const core::ControllerTracker& self, const core::ITrackerSession& session) -> core::ControllerSnapshotTrackedT
-            { return self.get_left_controller(session); },
-            py::arg("session"), "Get the left controller tracked state (data is None if inactive)")
+            [](const core::ControllerTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_left_controller(session)); },
+            py::arg("session"), "Get the left controller tracked state (None if inactive)")
         .def(
             "get_right_controller",
-            [](const core::ControllerTracker& self, const core::ITrackerSession& session) -> core::ControllerSnapshotTrackedT
-            { return self.get_right_controller(session); },
-            py::arg("session"), "Get the right controller tracked state (data is None if inactive)")
+            [](const core::ControllerTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_right_controller(session)); },
+            py::arg("session"), "Get the right controller tracked state (None if inactive)")
         .def(
             "apply_left_haptic_feedback",
             [](const core::ControllerTracker& self, const core::ITrackerSession& session, float amplitude,
@@ -109,9 +133,8 @@ PYBIND11_MODULE(_deviceio_trackers, m)
              "Construct a MessageChannelTracker for XR_NV_opaque_data_channel")
         .def(
             "get_messages",
-            [](const core::MessageChannelTracker& self,
-               const core::ITrackerSession& session) -> core::MessageChannelMessagesTrackedT
-            { return self.get_messages(session); },
+            [](const core::MessageChannelTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_messages(session)); },
             py::arg("session"), "Get all messages drained during the last update (possibly empty)")
         .def(
             "get_status",
@@ -121,36 +144,33 @@ PYBIND11_MODULE(_deviceio_trackers, m)
         .def(
             "send_message",
             [](const core::MessageChannelTracker& self, const core::ITrackerSession& session,
-               const core::MessageChannelMessagesT& message) { self.send_message(session, message.payload); },
+               const core::Serialized<core::MessageChannelMessages>& message)
+            {
+                const auto* payload = message ? message->payload() : nullptr;
+                self.send_message(session, payload != nullptr ? std::vector<uint8_t>(payload->begin(), payload->end()) :
+                                                                std::vector<uint8_t>{});
+            },
             py::arg("session"), py::arg("message"), "Send a MessageChannelMessages payload over the message channel");
 
-    py::class_<core::FrameMetadataTrackerOak, core::ITracker, std::shared_ptr<core::FrameMetadataTrackerOak>>(
-        m, "FrameMetadataTrackerOak")
-        .def(py::init<const std::string&, const std::vector<core::StreamType>&, size_t>(), py::arg("collection_prefix"),
-             py::arg("streams"),
-             py::arg("max_flatbuffer_size") = core::FrameMetadataTrackerOak::DEFAULT_MAX_FLATBUFFER_SIZE,
-             "Construct a multi-stream FrameMetadataTrackerOak")
+    py::class_<core::HapticCommandReaderTracker, core::ITracker, std::shared_ptr<core::HapticCommandReaderTracker>>(
+        m, "HapticCommandReaderTracker")
+        .def(py::init<const std::string&, std::size_t>(), py::arg("collection_id"),
+             py::arg("max_payload_size") = core::HapticCommandReaderTracker::DEFAULT_MAX_PAYLOAD_SIZE)
         .def(
-            "get_stream_data",
-            [](const core::FrameMetadataTrackerOak& self, const core::ITrackerSession& session,
-               size_t stream_index) -> core::FrameMetadataOakTrackedT
-            { return self.get_stream_data(session, stream_index); },
-            py::arg("session"), py::arg("stream_index"),
-            "Get FrameMetadataOakTrackedT for a specific stream by index; .data is None until first frame arrives")
-        .def_property_readonly("stream_count", &core::FrameMetadataTrackerOak::get_stream_count,
-                               "Number of streams this tracker is configured for");
+            "get_data",
+            [](const core::HapticCommandReaderTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_data(session)); },
+            py::arg("session"), "Get the latest haptic command (None when no data available)")
+        .def(
+            "get_data",
+            [](const core::HapticCommandReaderTracker& self, const core::ITrackerSession& session,
+               std::string_view endpoint) { return to_python(self.get_data(session, endpoint)); },
+            py::arg("session"), py::arg("endpoint"),
+            "Get the latest haptic command for one endpoint (None when no data available)");
 
-    py::class_<core::Generic3AxisPedalTracker, core::ITracker, std::shared_ptr<core::Generic3AxisPedalTracker>>(
-        m, "Generic3AxisPedalTracker")
-        .def(py::init<const std::string&, size_t>(), py::arg("collection_id"),
-             py::arg("max_flatbuffer_size") = core::Generic3AxisPedalTracker::DEFAULT_MAX_FLATBUFFER_SIZE,
-             "Construct a Generic3AxisPedalTracker for the given tensor collection ID")
-        .def(
-            "get_pedal_data",
-            [](const core::Generic3AxisPedalTracker& self,
-               const core::ITrackerSession& session) -> core::Generic3AxisPedalOutputTrackedT
-            { return self.get_data(session); },
-            py::arg("session"), "Get the current foot pedal tracked state (data is None when no data available)");
+    // py::class_ blocks for every manifest tracker; the accessor name comes from the
+    // manifest's python_accessor key.
+#include "generated_tracker_bindings.inc"
 
     py::class_<core::TensorPushTracker, core::ITracker, std::shared_ptr<core::TensorPushTracker>> tensor_push_tracker(
         m, "TensorPushTracker");
@@ -171,25 +191,16 @@ PYBIND11_MODULE(_deviceio_trackers, m)
             },
             py::arg("session"), py::arg("payload"),
             "Push one serialized payload (bytes, length <= max_payload_size) to the paired consumer.");
-    py::class_<core::JointStateTracker, core::ITracker, std::shared_ptr<core::JointStateTracker>>(m, "JointStateTracker")
-        .def(py::init<const std::string&, size_t>(), py::arg("collection_id"),
-             py::arg("max_flatbuffer_size") = core::JointStateTracker::DEFAULT_MAX_FLATBUFFER_SIZE,
-             "Construct a JointStateTracker for the given tensor collection ID (one generic "
-             "joint-space device: leader arm, exoskeleton, ...)")
-        .def(
-            "get_data",
-            [](const core::JointStateTracker& self, const core::ITrackerSession& session) -> core::JointStateOutputTrackedT
-            { return self.get_data(session); },
-            py::arg("session"), "Get the current joint-state tracked snapshot (data is None when no data available)");
 
-    py::class_<core::FullBodyTrackerPico, core::ITracker, std::shared_ptr<core::FullBodyTrackerPico>>(
-        m, "FullBodyTrackerPico")
-        .def(py::init<>())
+    py::class_<core::FullBodyTracker, core::ITracker, std::shared_ptr<core::FullBodyTracker>>(m, "FullBodyTracker")
+        .def(py::init<>(),
+             "Construct a vendor-agnostic full body tracker marker. The live session selects the "
+             "vendor via VendorConfig (default: native PICO XR_BD_body_tracking); replay is vendor-neutral.")
         .def(
             "get_body_pose",
-            [](const core::FullBodyTrackerPico& self, const core::ITrackerSession& session) -> core::FullBodyPosePicoTrackedT
-            { return self.get_body_pose(session); },
-            py::arg("session"), "Get full body pose tracked state (data is None if inactive)");
+            [](const core::FullBodyTracker& self, const core::ITrackerSession& session)
+            { return to_python(self.get_body_pose(session)); },
+            py::arg("session"), "Get full body pose tracked state (None if inactive)");
 
     m.attr("NUM_JOINTS") = static_cast<int>(core::HandJoint_NUM_JOINTS);
     m.attr("JOINT_PALM") = static_cast<int>(core::HandJoint_PALM);

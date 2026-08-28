@@ -7,10 +7,11 @@
 # The SDK tarball (CloudXR-<VERSION>-Linux-<ARCH>-sdk.tar.gz) is placed in deps/cloudxr/
 # for use by Dockerfile.runtime.
 #
-# Three ways to obtain the SDK (tried in order):
+# Two ways to obtain the SDK:
 # 1) Local tarball: place CloudXR-<VERSION>-Linux-<ARCH>-sdk.tar.gz in deps/cloudxr/.
-# 2) Public NGC: downloads via curl from the public NGC resource API.
-# 3) Private NGC: downloads via curl from the private NGC resource API; requires NGC_API_KEY.
+# 2) Public NGC: RC versions use nvidia/cloudxr-runtime-for-isaac-teleop directly.
+#    Other versions try nvidia/cloudxr-runtime first and fall back to the unlisted resource.
+# Optional: set CXR_DOWNLOAD_EXP=1 to also download CloudXR-exp-<VERSION>-....
 
 set -Eeuo pipefail
 
@@ -53,37 +54,96 @@ case "$(uname -m)" in
 esac
 
 SDK_FILE="CloudXR-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk.tar.gz"
-SDK_DIR="CloudXR-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk"
-SDK_RELEASE_DIR="$CXR_DEPLOYMENT_DIR/$SDK_DIR"
+EXP_SDK_FILE="CloudXR-exp-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk.tar.gz"
+
+# Remote names on NGC, newest convention first. 6.3.0-rc4 renamed the published
+# tarballs to a "-external" infix; the payload is unchanged. Downloads are always
+# saved as $SDK_FILE / $EXP_SDK_FILE, which is what CMake and Dockerfile.runtime-ngc
+# expect on disk.
+SDK_REMOTE_FILES=(
+    "CloudXR-external-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk.tar.gz"
+    "$SDK_FILE"
+)
+EXP_SDK_REMOTE_FILES=(
+    "CloudXR-exp-external-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk.tar.gz"
+    "$EXP_SDK_FILE"
+)
 
 is_valid_sdk_bundle() {
     local dir="$1"
-    [[ -f "$dir/$SDK_FILE" ]]
-}
-
-# Returns 0 if the given directory has valid SDK layout (contains libcloudxr.so).
-is_valid_sdk_layout() {
-    local dir="$1"
-    [[ -d "$dir" ]] && [[ -f "$dir/libcloudxr.so" ]]
+    [[ -f "$dir/$SDK_FILE" ]] || return 1
+    if [[ "${CXR_DOWNLOAD_EXP:-0}" == "1" ]]; then
+        [[ -f "$dir/$EXP_SDK_FILE" ]] || return 1
+    fi
+    return 0
 }
 
 # -----------------------------------------------------------------------------
 # Local tarball: place $SDK_FILE in deps/cloudxr/
 # -----------------------------------------------------------------------------
 install_from_local_tarball() {
-    if [[ ! -f "$CXR_DEPLOYMENT_DIR/$SDK_FILE" ]]; then
+    if ! is_valid_sdk_bundle "$CXR_DEPLOYMENT_DIR"; then
         return 1
     fi
     echo -e "${GREEN}✓ CloudXR Runtime SDK found at $CXR_DEPLOYMENT_DIR/$SDK_FILE${NC}"
+    if [[ "${CXR_DOWNLOAD_EXP:-0}" == "1" ]]; then
+        echo -e "${GREEN}✓ CloudXR Experimental Runtime SDK found at $CXR_DEPLOYMENT_DIR/$EXP_SDK_FILE${NC}"
+    fi
     return 0
 }
 
 # -----------------------------------------------------------------------------
-# Public NGC: download via curl from the public NGC resource API
-# Resource: nvidia/cloudxr-runtime-for-isaac-teleop/${CXR_RUNTIME_SDK_VERSION}
+# NGC download helper
+# -----------------------------------------------------------------------------
+download_ngc_file() {
+    local url="$1"
+    local out_path="$2"
+    local label="$3"
+
+    local -a curl_args=(--fail --location --output "$out_path"
+        --connect-timeout 10 --max-time 120
+        --retry 3 --retry-delay 5)
+    if ! curl "${curl_args[@]}" "$url"; then
+        rm -f "$out_path"
+        return 1
+    fi
+    if [[ ! -s "$out_path" ]]; then
+        echo -e "${RED}Error: Downloaded ${label} is empty${NC}"
+        rm -f "$out_path"
+        return 1
+    fi
+}
+
+# Try each remote name in turn; the first that resolves wins.
+download_ngc_first_match() {
+    local base="$1"
+    local out_path="$2"
+    local label="$3"
+    shift 3
+    local -a remote_files=("$@")
+
+    [[ -s "$out_path" ]] && return 0
+
+    local remote
+    for remote in "${remote_files[@]}"; do
+        echo -e "${YELLOW}Downloading ${label} (${remote})...${NC}"
+        if download_ngc_file "${base}${remote}" "$out_path" "$label"; then
+            return 0
+        fi
+    done
+
+    echo -e "${RED}Error: Failed to download ${label}${NC}"
+    echo -e "${RED}Tried: ${remote_files[*]}${NC}"
+    return 1
+}
+
+# -----------------------------------------------------------------------------
+# Public NGC is anonymous. RC versions go directly to the unlisted Isaac Teleop resource;
+# non-RC versions try listed first and fall back to unlisted without credentials.
 # -----------------------------------------------------------------------------
 install_from_public_ngc() {
-    local NGC_URL="https://api.ngc.nvidia.com/v2/resources/org/nvidia/cloudxr-runtime-for-isaac-teleop/${CXR_RUNTIME_SDK_VERSION}/files?redirect=true&path=${SDK_FILE}"
+    local resource="$1"
+    local visibility="$2"
 
     if ! command -v curl &> /dev/null; then
         echo -e "${RED}Error: curl not found. Please install it first.${NC}"
@@ -92,105 +152,62 @@ install_from_public_ngc() {
     fi
 
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}Downloading CloudXR Runtime SDK${NC}"
+    echo -e "${GREEN}Downloading CloudXR Runtime SDK from ${visibility} NGC resource${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
 
     mkdir -p "$CXR_DEPLOYMENT_DIR"
 
-    echo -e "${YELLOW}Downloading CloudXR Runtime SDK from NGC...${NC}"
-    if ! curl --fail --location \
-        --output "$CXR_DEPLOYMENT_DIR/$SDK_FILE" \
-        "$NGC_URL"; then
-        echo -e "${RED}Error: Failed to download CloudXR Runtime SDK from NGC${NC}"
-        rm -f "$CXR_DEPLOYMENT_DIR/$SDK_FILE"
-        return 1
+    local base="https://api.ngc.nvidia.com/v2/resources/org/nvidia/${resource}/${CXR_RUNTIME_SDK_VERSION}/files?redirect=true&path="
+    download_ngc_first_match \
+        "$base" \
+        "$CXR_DEPLOYMENT_DIR/$SDK_FILE" \
+        "CloudXR Runtime SDK" \
+        "${SDK_REMOTE_FILES[@]}" || return 1
+    if [[ "${CXR_DOWNLOAD_EXP:-0}" == "1" ]]; then
+        download_ngc_first_match \
+            "$base" \
+            "$CXR_DEPLOYMENT_DIR/$EXP_SDK_FILE" \
+            "CloudXR Experimental Runtime SDK" \
+            "${EXP_SDK_REMOTE_FILES[@]}" || return 1
     fi
 
     echo -e "${GREEN}✓ CloudXR Runtime SDK installed successfully${NC}"
     echo ""
-}
-
-# -----------------------------------------------------------------------------
-# Private NGC: download via curl from the private NGC resource API
-# Resource: 0566138804516934/cloudxr-dev/cloudxr-runtime-binary:${VERSION}-public
-# Requires NGC_API_KEY for Bearer-token auth.
-# -----------------------------------------------------------------------------
-install_from_private_ngc() {
-    local NGC_ORG="0566138804516934"
-    local NGC_TEAM="cloudxr-dev"
-    local NGC_RESOURCE="cloudxr-runtime-binary"
-    local NGC_VERSION="${CXR_RUNTIME_SDK_VERSION}-public"
-    local NGC_SDK_FILE="CloudXR-external-${CXR_RUNTIME_SDK_VERSION}-Linux-${ARCH}-sdk.tar.gz"
-    local NGC_URL="https://api.ngc.nvidia.com/v2/org/${NGC_ORG}/team/${NGC_TEAM}/resources/${NGC_RESOURCE}/versions/${NGC_VERSION}/files/${NGC_SDK_FILE}"
-
-    if [[ -z "${NGC_API_KEY:-}" ]]; then
-        echo -e "${RED}Error: NGC_API_KEY is not set; cannot download from private NGC${NC}"
-        return 1
-    fi
-
-    if ! command -v curl &> /dev/null; then
-        echo -e "${RED}Error: curl not found. Please install it first.${NC}"
-        return 1
-    fi
-
-    echo -e "${GREEN}=================================================${NC}"
-    echo -e "${GREEN}Downloading CloudXR Runtime SDK from private NGC${NC}"
-    echo -e "${GREEN}=================================================${NC}"
-    echo ""
-
-    mkdir -p "$CXR_DEPLOYMENT_DIR"
-
-    echo -e "${YELLOW}Downloading CloudXR Runtime SDK from private NGC...${NC}"
-    if ! curl --fail --location \
-        -H "Authorization: Bearer $NGC_API_KEY" \
-        -H "Content-Type: application/json" \
-        --output "$CXR_DEPLOYMENT_DIR/$SDK_FILE" \
-        "$NGC_URL"; then
-        echo -e "${RED}Error: Failed to download CloudXR Runtime SDK from private NGC${NC}"
-        rm -f "$CXR_DEPLOYMENT_DIR/$SDK_FILE"
-        return 1
-    fi
-
-    echo -e "${GREEN}✓ CloudXR Runtime SDK installed successfully${NC}"
-    echo ""
-    return 0
 }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 
-# Check if SDK is already downloaded and extracted
-if ([[ -d "$SDK_RELEASE_DIR" ]] && is_valid_sdk_layout "$SDK_RELEASE_DIR") || \
-    (is_valid_sdk_bundle "$CXR_DEPLOYMENT_DIR"); then
-    echo -e "${GREEN}CloudXR Runtime SDK already present, skipping download${NC}"
-    exit 0
-fi
-
-# Error out if the target directory already exists
-if [[ -d "$SDK_RELEASE_DIR" ]]; then
-    echo -e "${RED}Error downloading CloudXR Runtime SDK:${NC}"
-    echo -e "${RED}  Target directory $SDK_RELEASE_DIR already exists,${NC}"
-    echo -e "${RED}  but does not contain the expected files.${NC}"
-    echo -e "${RED}  Please remove the directory and try again.${NC}"
-    exit 1
-fi
-
 # Prefer local tarball if present; otherwise use NGC
 if install_from_local_tarball; then
     exit 0
 fi
 
-echo "Cannot install from local tarball, trying public NGC..."
-if install_from_public_ngc; then
+if [[ "$CXR_RUNTIME_SDK_VERSION" == *-rc* ]]; then
+    NGC_RESOURCE="cloudxr-runtime-for-isaac-teleop"
+    NGC_VISIBILITY="unlisted"
+else
+    NGC_RESOURCE="cloudxr-runtime"
+    NGC_VISIBILITY="listed"
+fi
+
+echo "Cannot install from local tarball, trying ${NGC_VISIBILITY} public NGC..."
+if install_from_public_ngc "$NGC_RESOURCE" "$NGC_VISIBILITY"; then
     exit 0
 fi
 
-echo "Cannot install from public NGC, trying private NGC..."
-if install_from_private_ngc; then
-    exit 0
+if [[ "$NGC_VISIBILITY" == "listed" ]]; then
+    NGC_RESOURCE="cloudxr-runtime-for-isaac-teleop"
+    NGC_VISIBILITY="unlisted"
+    echo "Cannot install from listed public NGC, trying unlisted public NGC..."
+    # Do not combine a partial listed download with the unlisted SDK bundle.
+    rm -f "$CXR_DEPLOYMENT_DIR/$SDK_FILE" "$CXR_DEPLOYMENT_DIR/$EXP_SDK_FILE"
+    if install_from_public_ngc "$NGC_RESOURCE" "$NGC_VISIBILITY"; then
+        exit 0
+    fi
 fi
 
-echo "Cannot install from private NGC, exiting..."
+echo "Cannot install from ${NGC_VISIBILITY} public NGC, exiting..."
 exit 1

@@ -1,12 +1,12 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Test script for FullBodyTrackerPico with XR_BD_body_tracking extension.
+Test script for FullBodyTracker with XR_BD_body_tracking extension.
 
 Demonstrates:
 - Getting full body pose data (24 joints from pelvis to hands)
-- Requires PICO device with body tracking support
+- Requires PICO device with body tracking support (default "body.pico-xr" vendor)
 """
 
 import time
@@ -22,7 +22,7 @@ print()
 
 # Test 1: Create full body tracker
 print("[Test 1] Creating full body tracker...")
-body_tracker = deviceio.FullBodyTrackerPico()
+body_tracker = deviceio.FullBodyTracker()
 print(f"✓ {body_tracker.get_name()} created")
 print()
 
@@ -33,10 +33,10 @@ required_extensions = deviceio.DeviceIOSession.get_required_extensions(trackers)
 print(f"Required extensions: {required_extensions}")
 print()
 
-# Test 3: Show joint names from schema (BodyJointPico enum)
-print(f"[Test 3] Body joint names ({schema.BodyJointPico.NUM_JOINTS} joints):")
-for i in range(schema.BodyJointPico.NUM_JOINTS):
-    print(f"  [{i:2d}] {schema.BodyJointPico(i).name}")
+# Test 3: Show joint names from schema (BodyJoint enum)
+print(f"[Test 3] Body joint names ({schema.BodyJoint.NUM_JOINTS} joints):")
+for i in range(schema.BodyJoint.NUM_JOINTS):
+    print(f"  [{i:2d}] {schema.BodyJoint(i).name}")
 print()
 
 # Test 4: Initialize
@@ -63,17 +63,15 @@ with oxr.OpenXRSession("FullBodyTrackerTest", required_extensions) as oxr_sessio
         # Test 6: Check initial body tracking state
         print("[Test 6] Checking body tracking state...")
         body_tracked = body_tracker.get_body_pose(session)
-        print(
-            f"  Body tracking active: {'YES' if body_tracked.data is not None else 'NO'}"
-        )
+        print(f"  Body tracking active: {'YES' if body_tracked else 'NO'}")
 
-        if body_tracked.data is not None:
+        if body_tracked:
             valid_count = sum(
                 1
-                for i in range(schema.BodyJointPico.NUM_JOINTS)
-                if body_tracked.data.joints.joints(i).is_valid
+                for i in range(schema.BodyJoint.NUM_JOINTS)
+                if body_tracked.joints.joints(i).is_valid
             )
-            print(f"  Valid joints: {valid_count}/{schema.BodyJointPico.NUM_JOINTS}")
+            print(f"  Valid joints: {valid_count}/{schema.BodyJoint.NUM_JOINTS}")
         print()
 
         # Test 7: Run tracking loop
@@ -94,12 +92,12 @@ with oxr.OpenXRSession("FullBodyTrackerTest", required_extensions) as oxr_sessio
                 elapsed = current_time - start_time
                 body_tracked = body_tracker.get_body_pose(session)
 
-                if body_tracked.data is not None:
-                    pelvis_pos = body_tracked.data.joints.joints(
-                        int(schema.BodyJointPico.PELVIS)
+                if body_tracked:
+                    pelvis_pos = body_tracked.joints.joints(
+                        int(schema.BodyJoint.PELVIS)
                     ).pose.position
-                    head_pos = body_tracked.data.joints.joints(
-                        int(schema.BodyJointPico.HEAD)
+                    head_pos = body_tracked.joints.joints(
+                        int(schema.BodyJoint.HEAD)
                     ).pose.position
                     print(
                         f"  [{elapsed:5.2f}s] Frame {frame_count:4d}"
@@ -121,16 +119,14 @@ with oxr.OpenXRSession("FullBodyTrackerTest", required_extensions) as oxr_sessio
         print("[Test 8] Final body pose state...")
         body_tracked = body_tracker.get_body_pose(session)
 
-        print(
-            f"  Body tracking active: {'YES' if body_tracked.data is not None else 'NO'}"
-        )
+        print(f"  Body tracking active: {'YES' if body_tracked else 'NO'}")
 
-        if body_tracked.data is not None:
+        if body_tracked:
             print()
             print("  Joint positions:")
-            for i in range(schema.BodyJointPico.NUM_JOINTS):
-                joint = body_tracked.data.joints.joints(i)
-                name = schema.BodyJointPico(i).name
+            for i in range(schema.BodyJoint.NUM_JOINTS):
+                joint = body_tracked.joints.joints(i)
+                name = schema.BodyJoint(i).name
                 pos = joint.pose.position
                 rot = joint.pose.orientation
                 print(

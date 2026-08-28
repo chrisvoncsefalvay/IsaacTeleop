@@ -14,28 +14,32 @@ assembles a frozen ``NodeParameters`` snapshot.
 
 import itertools
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
-from rclpy.node import Node
-from rclpy.parameter import Parameter
-from scipy.spatial.transform import Rotation
-
+from constants import (
+    HAND_RETARGETERS,
+    HAND_TRACKING_PLUGINS,
+    TELEOP_MODES,
+    TRACKED_HAND_RETARGETERS,
+    WUJI_HAND_MODELS,
+    HandRetargeter,
+    HandTrackingPlugin,
+    TeleopMode,
+    resolve_hand_retargeter,
+)
+from isaacteleop.cloudxr.oob_teleop_env import TELEOP_CLIENT_ROUTE_ENV
 from isaacteleop.deviceio import McapReplayConfig
 from isaacteleop.retargeting_engine.deviceio_source_nodes.pedals_source import (
     DEFAULT_PEDAL_COLLECTION_ID,
 )
 from isaacteleop.teleop_session_manager import SessionMode
-
-from constants import (
-    HAND_RETARGETERS,
-    TELEOP_MODES,
-    HandRetargeter,
-    resolve_hand_retargeter,
-    uses_hands_source_for_controller,
-)
+from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from scipy.spatial.transform import Rotation
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,7 @@ class CloudXRParams:
 
     install_dir: str
     env_config: str | None
+    client_route: str
     accept_eula: bool
     setup_oob: bool
     usb_local: bool
@@ -57,11 +62,13 @@ class CloudXRParams:
 class NodeParameters:
     """Resolved snapshot of every ROS parameter consumed by TeleopRos2Node."""
 
-    mode: str
+    mode: TeleopMode
     sleep_period_s: float
     hand_retargeter: HandRetargeter
     resolved_hand_retargeter: HandRetargeter
-    controller_uses_hands_source: bool
+    hand_tracking_plugin: HandTrackingPlugin
+    plugin_search_paths: tuple[Path, ...]
+    wuji_hand_model: str
     config_asset_root: Path
     session_mode: SessionMode
     mcap_config: McapReplayConfig | None
@@ -98,6 +105,18 @@ def _load_cloudxr(node: Node) -> CloudXRParams:
                 "Optional CloudXR env file (KEY=value per line) passed to "
                 "CloudXRLauncher to override default CloudXR env vars. Empty "
                 "uses the built-in defaults."
+            ),
+        ),
+    )
+    node.declare_parameter(
+        "cloudxr_client_route",
+        os.environ.get(TELEOP_CLIENT_ROUTE_ENV, "/real/ros2"),
+        ParameterDescriptor(
+            type=ParameterType.PARAMETER_STRING,
+            description=(
+                "WebXR client route exported as TELEOP_CLIENT_ROUTE before CloudXR "
+                "launch. Defaults to the inherited environment value when set, "
+                "otherwise /real/ros2. Empty suppresses the URL route."
             ),
         ),
     )
@@ -159,6 +178,11 @@ def _load_cloudxr(node: Node) -> CloudXRParams:
             )
         env_config = str(env_config_path)
 
+    client_route = (
+        node.get_parameter("cloudxr_client_route")
+        .get_parameter_value()
+        .string_value.strip()
+    )
     accept_eula = (
         node.get_parameter("cloudxr_accept_eula").get_parameter_value().bool_value
     )
@@ -170,7 +194,14 @@ def _load_cloudxr(node: Node) -> CloudXRParams:
         raise ValueError(
             "Parameter 'cloudxr_usb_local' requires 'cloudxr_setup_oob' to be true"
         )
-    return CloudXRParams(install_dir, env_config, accept_eula, setup_oob, usb_local)
+    return CloudXRParams(
+        install_dir=install_dir,
+        env_config=env_config,
+        client_route=client_route,
+        accept_eula=accept_eula,
+        setup_oob=setup_oob,
+        usb_local=usb_local,
+    )
 
 
 def _load_config_asset_root(node: Node) -> Path:
@@ -181,7 +212,7 @@ def _load_config_asset_root(node: Node) -> Path:
             type=ParameterType.PARAMETER_STRING,
             description=(
                 "Directory containing teleop_ros2 configs/ and assets/. "
-                "Leave empty to use the installed or source example root."
+                "Leave empty to use the installed or source tree root."
             ),
         ),
     )
@@ -283,8 +314,8 @@ def _load_frames(node: Node) -> tuple[str, str, str, str]:
 
 
 def _load_hand_retargeter(
-    node: Node, mode: str
-) -> tuple[HandRetargeter, HandRetargeter, bool]:
+    node: Node, mode: TeleopMode
+) -> tuple[HandRetargeter, HandRetargeter]:
     node.declare_parameter(
         "hand_retargeter",
         HandRetargeter.MODE_DEFAULT.value,
@@ -293,7 +324,7 @@ def _load_hand_retargeter(
                 "Hand retargeter backend. 'mode_default' resolves to "
                 "'trihand' in controller_teleop and 'dexpilot' in "
                 "hand_teleop. Valid values: 'mode_default', 'trihand', "
-                "'pink_ik', or 'dexpilot'."
+                "'pink_ik', 'dexpilot', or 'wuji'."
             )
         ),
     )
@@ -308,16 +339,78 @@ def _load_hand_retargeter(
             f"got {raw_hand_retargeter!r}"
         ) from exc
     resolved_hand_retargeter = resolve_hand_retargeter(mode, hand_retargeter)
-    controller_uses_hands_source = uses_hands_source_for_controller(
-        mode, resolved_hand_retargeter
-    )
-    if mode in ("hand_teleop", "controller_teleop"):
+    if mode in (TeleopMode.HAND_TELEOP, TeleopMode.CONTROLLER_TELEOP):
         node.get_logger().info(f"Hand retargeter: {resolved_hand_retargeter}")
-    if controller_uses_hands_source:
-        node.get_logger().info(
-            "Applying MANUS controller-to-hand transform after pose transform."
+    return hand_retargeter, resolved_hand_retargeter
+
+
+def _load_hand_tracking_plugin(
+    node: Node,
+    mode: TeleopMode,
+    resolved_hand_retargeter: HandRetargeter,
+    session_mode: SessionMode,
+) -> tuple[HandTrackingPlugin, tuple[Path, ...]]:
+    node.declare_parameter(
+        "hand_tracking_plugin",
+        HandTrackingPlugin.NONE.value,
+        ParameterDescriptor(
+            description=(
+                "Optional hand-tracking input plugin managed by this node. "
+                "Use 'none' for native OpenXR or a manually launched plugin. "
+                "Valid managed plugins: 'manus' or 'wuji'."
+            ),
+            additional_constraints=f"Must be one of {HAND_TRACKING_PLUGINS}.",
+        ),
+    )
+    raw_plugin = (
+        node.get_parameter("hand_tracking_plugin")
+        .get_parameter_value()
+        .string_value.strip()
+    )
+    try:
+        plugin = HandTrackingPlugin(raw_plugin)
+    except ValueError as exc:
+        raise ValueError(
+            f"Parameter 'hand_tracking_plugin' must be one of "
+            f"{HAND_TRACKING_PLUGINS}, got {raw_plugin!r}"
+        ) from exc
+
+    search_paths = tuple(
+        dict.fromkeys(
+            Path(value).expanduser().resolve()
+            for value in os.environ.get("ISAAC_TELEOP_PLUGIN_PATH", "").split(
+                os.pathsep
+            )
+            if value.strip()
         )
-    return hand_retargeter, resolved_hand_retargeter, controller_uses_hands_source
+    )
+    if plugin == HandTrackingPlugin.NONE:
+        return plugin, search_paths
+
+    if session_mode == SessionMode.REPLAY:
+        node.get_logger().info(
+            f"Ignoring hand_tracking_plugin:={plugin} during MCAP replay."
+        )
+        return HandTrackingPlugin.NONE, search_paths
+
+    consumes_tracked_hands = mode == TeleopMode.HAND_TELEOP or (
+        mode == TeleopMode.CONTROLLER_TELEOP
+        and resolved_hand_retargeter in TRACKED_HAND_RETARGETERS
+    )
+    if not consumes_tracked_hands:
+        raise ValueError(
+            f"hand_tracking_plugin:={plugin} requires a tracked-hand mode; "
+            f"mode:={mode} with hand_retargeter:={resolved_hand_retargeter} "
+            "does not consume OpenXR hand tracking"
+        )
+
+    if not any(path.is_dir() for path in search_paths):
+        raise FileNotFoundError(
+            "No existing plugin search directory was found in ISAAC_TELEOP_PLUGIN_PATH"
+        )
+
+    node.get_logger().info(f"Managed hand-tracking plugin: {plugin}")
+    return plugin, search_paths
 
 
 def _load_mcap_replay(
@@ -349,13 +442,15 @@ def _load_mcap_replay(
     return SessionMode.REPLAY, McapReplayConfig(str(replay_path))
 
 
-def _load_mode(node: Node) -> str:
-    node.declare_parameter("mode", "controller_teleop")
-    mode = node.get_parameter("mode").get_parameter_value().string_value
-    if mode not in TELEOP_MODES:
+def _load_mode(node: Node) -> TeleopMode:
+    node.declare_parameter("mode", TeleopMode.CONTROLLER_TELEOP.value)
+    raw_mode = node.get_parameter("mode").get_parameter_value().string_value
+    try:
+        mode = TeleopMode(raw_mode)
+    except ValueError as exc:
         raise ValueError(
-            f"Parameter 'mode' must be one of {TELEOP_MODES}, got {mode!r}"
-        )
+            f"Parameter 'mode' must be one of {TELEOP_MODES}, got {raw_mode!r}"
+        ) from exc
     node.get_logger().info(f"Mode: {mode}")
     return mode
 
@@ -456,17 +551,44 @@ def _load_transform_translation(node: Node) -> list[float] | None:
     return [float(x) for x in transform_trans_arr]
 
 
+def _load_wuji_hand_model(node: Node) -> str:
+    parameter_name = "wuji_hand_model"
+    node.declare_parameter(
+        parameter_name,
+        "wuji_hand_2",
+        ParameterDescriptor(
+            description=(
+                "Wuji model used for left- and right-hand retargeting. "
+                "Valid values: 'wuji_hand' or 'wuji_hand_2'."
+            ),
+            additional_constraints=f"Must be one of {WUJI_HAND_MODELS}.",
+        ),
+    )
+    model = (
+        node.get_parameter(parameter_name).get_parameter_value().string_value.strip()
+    )
+    if model not in WUJI_HAND_MODELS:
+        raise ValueError(
+            f"Parameter '{parameter_name}' must be one of {WUJI_HAND_MODELS}, "
+            f"got {model!r}"
+        )
+    return model
+
+
 def create_node_parameters(node: Node) -> NodeParameters:
     """Declare every ROS parameter on ``node``, validate, and return the snapshot."""
     rate_hz = _load_rate_hz(node)
     mode = _load_mode(node)
-    (
-        hand_retargeter,
-        resolved_hand_retargeter,
-        controller_uses_hands_source,
-    ) = _load_hand_retargeter(node, mode)
+    hand_retargeter, resolved_hand_retargeter = _load_hand_retargeter(node, mode)
+    wuji_hand_model = _load_wuji_hand_model(node)
     config_asset_root = _load_config_asset_root(node)
     session_mode, mcap_config = _load_mcap_replay(node)
+    hand_tracking_plugin, plugin_search_paths = _load_hand_tracking_plugin(
+        node,
+        mode,
+        resolved_hand_retargeter,
+        session_mode,
+    )
     cloudxr_params = _load_cloudxr(node)
     pedal_collection_id = _load_pedal_collection_id(node)
     world_frame, right_wrist_frame, left_wrist_frame, head_frame = _load_frames(node)
@@ -480,7 +602,9 @@ def create_node_parameters(node: Node) -> NodeParameters:
         sleep_period_s=1.0 / rate_hz,
         hand_retargeter=hand_retargeter,
         resolved_hand_retargeter=resolved_hand_retargeter,
-        controller_uses_hands_source=controller_uses_hands_source,
+        hand_tracking_plugin=hand_tracking_plugin,
+        plugin_search_paths=plugin_search_paths,
+        wuji_hand_model=wuji_hand_model,
         config_asset_root=config_asset_root,
         session_mode=session_mode,
         mcap_config=mcap_config,

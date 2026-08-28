@@ -25,7 +25,7 @@ cameras:
       # gop:                    # default: fps*5 (ULL tuning)
 
 display:
-  mode: window                  # window | xr
+  mode: xr                      # xr | window (xr is the default)
   window:
     width: 1280
     height: 720
@@ -36,4 +36,4 @@ display:
   placements:
     synth:                      # size defaults to 1.0 m wide × aspect-derived height
       lock_mode: lazy
-      distance: 1.5
+      distance: 1.0

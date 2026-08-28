@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include <deviceio_base/tracker.hpp>
+#include <schema/serialized.hpp>
+namespace core
+{
+struct @FB_TABLE@;
+class @IFACE@ : public ITrackerImpl
+{
+public:
+    virtual void push(const Serialized<@FB_TABLE@>& data) const = 0;
+};
+} // namespace core

@@ -1,0 +1,46 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#include "@LIVE_IMPL_FILE@.hpp"
+
+#include <oxr_utils/os_time.hpp>
+
+#include <span>
+#include <stdexcept>
+
+namespace core
+{
+namespace
+{
+SchemaPusherConfig make_@NAME@_push_config(const @CLASS@* tracker)
+{
+    SchemaPusherConfig cfg;
+    cfg.collection_id = tracker->collection_id();
+    cfg.max_flatbuffer_size = tracker->max_payload_size();
+    cfg.tensor_identifier = tracker->tensor_identifier();
+    cfg.localized_name = tracker->tensor_identifier();
+    return cfg;
+}
+} // namespace
+@LIVE_IMPL@::@LIVE_IMPL@(const OpenXRSessionHandles& handles, const @CLASS@* tracker)
+    : pusher_(handles, make_@NAME@_push_config(tracker))
+{
+    // No-op: members set in the initializer list.
+}
+void @LIVE_IMPL@::update(int64_t monotonic_time_ns)
+{
+    last_update_time_ns_ = monotonic_time_ns;
+}
+void @LIVE_IMPL@::push(const Serialized<@FB_TABLE@>& data) const
+{
+    // The handle already holds the wire payload, so this is a copy into the tensor and
+    // nothing else -- no unpack on the way in, no re-encode on the way out.
+    const std::span<const uint8_t> bytes = data.buffer();
+    if (bytes.empty())
+    {
+        throw std::invalid_argument("@CLASS@::push: data must be an encoded @FB_TABLE@");
+    }
+    const int64_t now_ns = last_update_time_ns_ > 0 ? last_update_time_ns_ : core::os_monotonic_now_ns();
+    pusher_.push_buffer(bytes.data(), bytes.size(), now_ns, now_ns);
+}
+} // namespace core

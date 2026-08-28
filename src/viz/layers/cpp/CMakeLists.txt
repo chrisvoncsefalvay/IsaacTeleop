@@ -7,11 +7,17 @@ cmake_minimum_required(VERSION 3.20)
 # session's contract for what a layer is — lives in viz::session, not
 # here, so we depend on viz::session for the base class. Test-only
 # helper layers (ClearRectLayer, ThrowingLayer) live in
-# viz/layers_tests/.
+# tests/cpp/viz/support/layers_testing/.
 add_library(viz_layers STATIC
+    image_layer_base.cpp
     quad_layer.cpp
+    cylinder_layer.cpp
+    equirect_layer.cpp
     projection_layer.cpp
+    inc/viz/layers/image_layer_base.hpp
     inc/viz/layers/quad_layer.hpp
+    inc/viz/layers/cylinder_layer.hpp
+    inc/viz/layers/equirect_layer.hpp
     inc/viz/layers/projection_layer.hpp
 )
 

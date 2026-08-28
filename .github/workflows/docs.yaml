@@ -8,12 +8,14 @@
 # - Fork PR: build only; a maintainer can deploy via `/preview-docs` (see
 #   docs-preview-on-demand.yaml).
 #
+# - PR close: docs-cleanup-preview.yaml removes preview/pr-<N>/.
+# - Nightly/manual: docs-preview-sweep.yaml drops previews whose PRs are closed.
+#
 # Builds are gated on changed paths by the `changes` job; gh-pages
 # `keep_files: true` preserves whichever artifact was skipped.
+# Deploy writers share concurrency group `docs-gh-pages` with cleanup/sweep.
 #
-# Web client uses the private CloudXR SDK for pushes and for PRs whose
-# author is in ALLOWED_CLOUDXR_JS_PR_AUTHORS (Repo Settings → Variables);
-# all other PRs fall back to the public SDK.
+# The web client downloads its CloudXR SDK anonymously from public NGC resources.
 
 name: Build & deploy docs
 
@@ -45,7 +47,6 @@ jobs:
     outputs:
       is-canonical-repo: ${{ steps.is-canonical-repo.outputs.defined }}
       is-deploy-branch: ${{ steps.is-deploy-branch.outputs.defined }}
-      use_ngc_key: ${{ steps.ngc-allowlist.outputs.use_ngc_key }}
     steps:
     - id: is-canonical-repo
       if: github.repository == 'NVIDIA/IsaacTeleop'
@@ -56,22 +57,6 @@ jobs:
         || startsWith(github.ref, 'refs/heads/release/')
         || startsWith(github.ref, 'refs/tags/v')
       run: echo "defined=true" >> "$GITHUB_OUTPUT"
-    - id: ngc-allowlist
-      run: |
-        if [ "${{ github.event_name }}" != 'pull_request' ]; then
-          echo "use_ngc_key=true" >> "$GITHUB_OUTPUT"
-        elif [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
-          echo "use_ngc_key=false" >> "$GITHUB_OUTPUT"
-        else
-          ACTOR="${{ github.actor }}"
-          ALLOWED="${{ vars.ALLOWED_CLOUDXR_JS_PR_AUTHORS }}"
-          # Normalize: remove spaces so "alice, bob" matches like "alice,bob"
-          ALLOWED="${ALLOWED// /}"
-          case ",${ALLOWED}," in
-            *",${ACTOR},"*) echo "use_ngc_key=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "use_ngc_key=false" >> "$GITHUB_OUTPUT" ;;
-          esac
-        fi
 
   # gh-pages keep_files preserves whichever artifact isn't rebuilt this run.
   changes:
@@ -124,6 +109,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Images/GIFs/etc. are stored in Git LFS (see .gitattributes). Without
+          # this, the working tree holds LFS pointer files and Sphinx copies the
+          # pointers verbatim, so the deployed site serves broken images.
+          lfs: true
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -143,6 +133,10 @@ jobs:
         if: needs.check-repo.outputs.is-canonical-repo == 'true' && needs.check-repo.outputs.is-deploy-branch == 'true'
         run: |
           git fetch --prune --unshallow --tags
+          # sphinx-multiversion checks each ref out into its own worktree, which
+          # smudges LFS files from the local object cache. `lfs: true` above only
+          # fetched HEAD's objects, so pull the rest for every built ref here.
+          git lfs fetch --all
           make multi-docs
 
       - name: Upload docs artifact
@@ -159,12 +153,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-      # Allowlist no → public only. Allowlist yes + NGC_API_KEY → private only.
       - name: Build CloudXR web client
         uses: ./.github/actions/build-cloudxr-web-client
-        with:
-          ngc-api-key: ${{ needs.check-repo.outputs.use_ngc_key == 'true' && secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY || '' }}
 
       - name: Upload web app artifact
         uses: actions/upload-artifact@v6
@@ -183,6 +176,10 @@ jobs:
       && needs.build-docs.result != 'failure'
       && needs.build-app.result != 'failure'
       && (needs.build-docs.result == 'success' || needs.build-app.result == 'success')
+    concurrency:
+      group: docs-gh-pages
+      cancel-in-progress: false
+      queue: max
     permissions:
       contents: write  # push to gh-pages
     steps:

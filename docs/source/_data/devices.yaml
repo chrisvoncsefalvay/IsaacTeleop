@@ -1,0 +1,271 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Source of truth for every table on the Ecosystem page; rendered by the
+# ``device-matrix`` directive (docs/source/_ext/ecosystem_grid.py).
+#
+# A row is: name, what it provides, and a Details button opening a panel. Required fields are
+# id, name, url, group, and modes; unknown fields fail the build.
+#   url      the manufacturer's product page. The name is that link, so no row carries
+#            a separate "Overview" link -- and no row needs an `acquire` entry that only
+#            repeats it.
+#   group    xr | peripheral | data_factory | cloud. ``ecosystem_grid.DEVICE_SECTIONS``
+#            maps groups onto tables: xr and peripheral share the input-device table and
+#            keep their group header rows, while data_factory and cloud get a table each
+#            and render no header row. A group no section claims fails the build.
+#   modes    the second column. Its heading is per section: "Input modes" for input
+#            devices, where the modes decide the available retargeters and control
+#            schemes, and "Provides" for the rest. One short phrase, not a sentence.
+#   company  optional; the mark of the company behind the device. A mark and nothing
+#            else -- no category and no copy, so the table stays the reference it is.
+#            `name` and `logo` are both required, `name` being the alt text; add
+#            `logo_dark` when a single-color mark would vanish against the other theme,
+#            and the two swap with the page. Files live in docs/source/_static/logos/.
+#            The mark sits above the Details panel's columns and nowhere else: marks in
+#            the row itself were tried before the name, after it, and beside the button,
+#            and all three crowded a table whose job is to be scanned.
+#   details  optional; the three panel columns, always rendered in the order
+#            set up / requirements / acquire. A column with nothing to say renders an em
+#            dash so the three stay aligned across devices. Omit `details` entirely and
+#            the row gets no button.
+#
+# A details entry is a bare string, a link, or a way to reach someone:
+#   - PICO OS 15.4.4U or newer
+#   - label: How To Connect             # plus exactly one of doc, ref, or url
+#     ref: connect-quest-pico
+#     note: runs in the headset browser # optional gloss, rendered after an em dash
+#   - email: sales@example.com          # renders as a mailto: link
+#   - phone: +1 (555) 123-4567          # renders as a tel: link
+# No sentences and no trailing periods: this is a reference table.
+#
+# Rows render in file order within their group, so the file reads like the page. There
+# is no `order` field to keep in sync.
+#
+# The docs site and the IsaacTeleop repository are both this project, so a link into
+# either is internal and gets no external marker. Only third-party domains do --
+# including other GitHub organizations such as isaac-sim.
+#
+# `planned` renders as one line under the table, not as a row. Its `tracking` url must
+# end in an issue or pull number, which the link label picks up: "Tracking #276".
+
+devices:
+  # ---------------------------------------------------------------------- xr --
+  - id: apple-vision-pro
+    name: Apple Vision Pro
+    url: https://www.apple.com/apple-vision-pro/
+    group: xr
+    modes: Hand tracking (26 joints), spatial controllers
+    details:
+      setup:
+        - label: Sample Client
+          url: https://github.com/isaac-sim/isaac-xr-teleop-sample-client-apple
+        - label: Connect Apple Vision Pro
+          ref: connect-apple-vision-pro
+      requirements:
+        - Built from source with Xcode
+      acquire:
+        - label: apple.com
+          url: https://www.apple.com/apple-vision-pro/
+
+  - id: meta-quest
+    name: Meta Quest 2 / 3 / 3S
+    url: https://www.meta.com/quest/
+    group: xr
+    modes: Motion controllers, hand tracking
+    details:
+      setup:
+        - label: How To Connect
+          ref: connect-quest-pico
+        - Isaac Teleop Web Client — runs in the headset browser
+      requirements:
+        - No additional software
+      acquire:
+        - label: meta.com
+          url: https://www.meta.com/quest/
+
+  - id: pico-4-ultra
+    name: PICO 4 Ultra
+    url: https://www.picoxr.com/products/pico4-ultra
+    group: xr
+    modes: Motion controllers, hand tracking
+    company:
+      name: PICO
+      logo: pico.svg
+      logo_dark: pico-dark.svg
+    details:
+      setup:
+        - label: How To Connect
+          ref: connect-quest-pico
+        - Isaac Teleop Web Client — runs in the headset browser
+      requirements:
+        - PICO OS 15.4.4U or newer
+      # Published with her consent, and repeated on the Motion Tracker row below.
+      acquire:
+        - Veronica Li
+        - email: Veronica.li@bytedance.com
+        - phone: +1 (909) 569-2774
+
+  - id: pico-motion-tracker
+    name: PICO Motion Tracker
+    url: https://www.picoxr.com/global/products/pico-motion-tracker
+    group: xr
+    modes: Full body tracking
+    details:
+      setup:
+        - label: Body Tracking guide
+          doc: /device/body_tracking
+        - Isaac Teleop Web Client
+      requirements:
+        - >-
+          PICO 4 Ultra Enterprise, or a consumer unit with enterprise features activated
+          (contact PICO)
+        - PICO OS 15.4.4U+ · PICO Browser 4.0.40+
+      acquire:
+        - Veronica Li
+        - email: Veronica.li@bytedance.com
+        - phone: +1 (909) 569-2774
+
+  # -------------------------------------------------------------- peripheral --
+  - id: manus-gloves
+    name: MANUS Metagloves Pro
+    url: https://www.manus-meta.com/products/metagloves-pro
+    group: peripheral
+    modes: High-fidelity finger tracking
+    company:
+      name: MANUS
+      logo: manus.svg
+      logo_dark: manus-dark.svg
+    details:
+      setup:
+        - label: MANUS Gloves Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/manus
+        - label: MANUS Gloves docs
+          doc: /device/manus
+      requirements:
+        - MANUS SDK
+        - USB receiver on the workstation
+      acquire:
+        - label: manus-meta.com
+          url: https://www.manus-meta.com/
+        - email: sales@manus-meta.com
+
+  - id: haptikos-exoskeletons
+    name: Haptikos Exoskeletons
+    url: https://haptikos.tech/product/haptikos/
+    group: peripheral
+    modes: Finger tracking, haptic feedback
+    company:
+      name: Haptikos
+      logo: haptikos.png
+      logo_dark: haptikos-dark.png
+    details:
+      setup:
+        - label: Haptikos Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/haptikos
+        - label: Haptikos docs
+          doc: /device/haptikos
+      requirements:
+        - Haptikos Robotics API
+      acquire:
+        - label: haptikos.tech
+          url: https://haptikos.tech/
+
+  - id: oglo-tactile-glove
+    name: OGLO Tactile Glove
+    url: https://www.opengraphlabs.com/
+    group: peripheral
+    modes: Tactile contact sensing (80 taxels), 6-axis IMU
+    company:
+      name: OpenGraph Labs
+      logo: opengraph-labs.svg
+      logo_dark: opengraph-labs-dark.svg
+    details:
+      setup:
+        - label: OGLO Tactile Glove Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/oglo_tactile
+        - label: OGLO Tactile Glove docs
+          doc: /device/oglo
+      requirements:
+        - Linux with BlueZ
+        - One BLE device per glove
+        - Plugin off by default — enable at build time
+
+  # The plugin is named generically because any 3-axis HID pedal goes through it.
+  - id: logitech-rudder-pedals
+    name: Logitech Rudder Pedals
+    url: https://www.logitechg.com/en-us/products/flight/flight-simulator-rudder-pedals.html
+    group: peripheral
+    modes: 3-axis foot pedal
+    details:
+      setup:
+        - label: Generic 3-axis Pedal Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/generic_3axis_pedal
+      requirements:
+        - USB connection to the workstation
+      acquire:
+        - label: logitechg.com
+          url: https://www.logitechg.com/en-us/shop/p/flight-simulator-rudder-pedals
+
+  - id: oak-d-camera
+    name: OAK-D Camera
+    url: https://shop.luxonis.com/products/oak-d
+    group: peripheral
+    modes: Offline data recording
+    details:
+      setup:
+        - label: OAK-D Camera Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/oak
+        - label: OAK Camera docs
+          doc: /device/oak
+      requirements:
+        - USB 3 connection to the workstation
+      acquire:
+        - label: shop.luxonis.com
+          url: https://shop.luxonis.com/
+
+  # ------------------------------------------------------------ data_factory --
+  - id: lerobot
+    name: LeRobot
+    url: https://huggingface.co/docs/lerobot
+    group: data_factory
+    modes: Robot learning framework, dataset collection
+    company:
+      name: Hugging Face
+      logo: hugging-face.svg
+      logo_dark: hugging-face-dark.svg
+    details:
+      setup:
+        - label: LeRobot integration
+          doc: /getting_started/lerobot/index
+        - label: LeRobot on GitHub
+          url: https://github.com/huggingface/lerobot
+
+  - id: lightwheel
+    name: Lightwheel
+    url: https://lightwheel.ai/
+    group: data_factory
+    modes: Ego data capture, simulation assets
+
+  - id: noitom
+    name: Noitom Motion Capture
+    url: https://www.noitom.com/
+    group: data_factory
+    modes: Full-body motion capture
+    details:
+      setup:
+        - label: Noitom Mocap Plugin
+          url: https://github.com/NVIDIA/IsaacTeleop/tree/main/src/plugins/noitom_mocap
+
+  # ------------------------------------------------------------------- cloud --
+  - id: volcano-engine
+    name: Volcano Engine
+    url: https://www.volcengine.com/
+    group: cloud
+    modes: Enterprise AI cloud platform
+
+planned:
+  - id: 3d-space-mouse
+    name: 3Dconnexion 3D Space Mouse
+    url: https://3dconnexion.com/us/spacemouse/
+    note: HID input over USB, CLI tool.
+    tracking: https://github.com/NVIDIA/IsaacTeleop/issues/276

@@ -15,6 +15,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Shared apt build dependencies. Each job installs these plus its own extras
+  # (ccache, clang-format, the OAK camera autotools chain).
+  CORE_APT_DEPS: build-essential cmake glslang-tools libvulkan-dev libwayland-dev libx11-dev libxcursor-dev libxext-dev libxi-dev libxinerama-dev libxkbcommon-dev libxrandr-dev patchelf pkg-config wayland-protocols
+  # Pin vcpkg to an immutable commit for reproducible, supply-chain-stable CI
+  # instead of tracking its moving default branch. Port versions are fixed by the
+  # consuming manifest's builtin-baseline (e.g. DepthAI's vcpkg.json), so this
+  # commit only needs to be recent enough to contain that baseline. Update the
+  # commit and its release-date comment together.
+  VCPKG_COMMIT: d015e31e90838a4c9dfa3eed45979bc70d9357fc  # 2026.05.25
+
 jobs:
   build-ubuntu:
     # Pin to 22.04 so the wheel is built with GCC 11's libstdc++. The resulting wheel
@@ -25,7 +36,7 @@ jobs:
       fail-fast: ${{ github.event_name == 'pull_request' }}
       matrix:
         build_type: ["Debug", "Release"]
-        python_version: ['3.10', '3.11', '3.12', '3.13']
+        python_version: ['3.11', '3.12', '3.13']
         arch: ['x64', 'arm64']
 
     steps:
@@ -34,21 +45,26 @@ jobs:
       with:
         fetch-depth: 0 # Full history for accurate git describe
 
+    # One build directory per job; later steps (ctest, coverage, test packaging,
+    # install) all refer to it through BUILD_DIR.
+    - name: Resolve build directory
+      run: echo "BUILD_DIR=build" >> "$GITHUB_ENV"
+
     - name: Install uv
       uses: ./.github/actions/setup-uv
 
     - name: Install Apt dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libx11-dev clang-format-14 ccache libvulkan-dev glslang-tools \
-          libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev libxkbcommon-dev \
-          libwayland-dev wayland-protocols autoconf automake libtool pkg-config libudev-dev
+        sudo apt-get install -y $CORE_APT_DEPS \
+          ccache clang-format-14 \
+          autoconf automake libtool libudev-dev
 
-    - name: Install patchelf (Release only)
-      if: ${{ matrix.build_type == 'Release' }}
+    - name: Install coverage tooling
+      if: ${{ matrix.build_type == 'Debug' && matrix.python_version == '3.11' && matrix.arch == 'x64' }}
       run: |
         sudo apt-get update
-        sudo apt-get install -y patchelf
+        sudo apt-get install -y gcovr
 
     # CUDA toolkit needed at link time for viz_core (device_image
     # links libcudart). The wheel itself excludes libcuda.so.1 via
@@ -60,24 +76,6 @@ jobs:
     - name: Setup CloudXR SDK
       id: cloudxr-sdk
       uses: ./.github/actions/setup-cloudxr-sdk
-      with:
-        ngc-api-key: ${{ secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY }}
-
-    # robotic_grounding source bundle for the [grounding] extra (Sharpa retargeter).
-    # Disabled on release branches (and PRs targeting them) to keep release
-    # artifacts free of V2D source: V2D is private/pre-release and shouldn't
-    # ship with anything stamped as a release. Also no-ops on forks that
-    # lack V2D_RETARGETER_TOKEN. In every disabled case the wheel build skips
-    # bundling robotic_grounding/, and Sharpa tests skip via the
-    # _HAS_PINOCCHIO guard. Must run BEFORE `Configure CMake` so the wheel
-    # staging step in src/core/python/CMakeLists.txt picks up
-    # deps/v2d/src/robotic_grounding/.
-    - name: Setup robotic_grounding source bundle
-      id: setup-v2d-src
-      if: ${{ !startsWith(github.ref_name, 'release/') && !startsWith(github.base_ref, 'release/') }}
-      uses: ./.github/actions/setup-v2d-src
-      with:
-        github-token: ${{ secrets.V2D_RETARGETER_TOKEN }}
 
     # vcpkg - required when BUILD_PLUGIN_OAK_CAMERA=ON for DepthAI v3.x deps
     - name: Cache vcpkg
@@ -85,15 +83,16 @@ jobs:
       with:
         path: |
           ~/vcpkg
-          build/vcpkg_installed
-        key: vcpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('cmake/DepthAIVcpkgManifest.cmake') }}
+          ${{ env.BUILD_DIR }}/vcpkg_installed
+        key: vcpkg-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python_version }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('cmake/DepthAIVcpkgManifest.cmake') }}
         restore-keys: |
-          vcpkg-${{ runner.os }}-${{ runner.arch }}-
+          vcpkg-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python_version }}-${{ env.VCPKG_COMMIT }}-
 
     - name: Setup vcpkg
       run: |
         if [ ! -f ~/vcpkg/vcpkg ]; then
           git clone https://github.com/microsoft/vcpkg ~/vcpkg
+          git -C ~/vcpkg checkout --detach "$VCPKG_COMMIT"
           ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
         fi
         echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
@@ -113,25 +112,86 @@ jobs:
 
     - name: Configure CMake
       run: |
-        cmake -B build \
-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+        coverage_args=()
+        if [[ "${{ matrix.build_type }}" == "Debug" && "${{ matrix.python_version }}" == "3.11" && "${{ matrix.arch }}" == "x64" ]]; then
+          coverage_args=(
+            -DCMAKE_C_FLAGS="--coverage -O0 -g"
+            -DCMAKE_CXX_FLAGS="--coverage -O0 -g"
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+            -DCMAKE_SHARED_LINKER_FLAGS="--coverage"
+            -DCMAKE_MODULE_LINKER_FLAGS="--coverage"
+          )
+        fi
+
+        cmake -B "${BUILD_DIR}" \
           -DISAAC_TELEOP_PYTHON_VERSION=${{ matrix.python_version }} \
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DBUILD_PLUGIN_OAK_CAMERA=ON \
           -DBUILD_VIZ=ON \
           -DENABLE_CLOUDXR_BUNDLE_CHECK=ON \
-          -DBUNDLE_ROBOTIC_GROUNDING=${{ steps.setup-v2d-src.outputs.bundled || 'false' }} \
-          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake \
+          "${coverage_args[@]}"
 
     - name: Build
-      run: cmake --build build --parallel 4
+      run: cmake --build "${BUILD_DIR}" --parallel 4
 
     - name: ccache stats
       run: ccache --show-stats
 
     - name: Run All Tests
-      run: ctest --test-dir build --output-on-failure --parallel
+      run: ctest --test-dir "${BUILD_DIR}" --output-on-failure --parallel
+
+    - name: Generate coverage report
+      if: ${{ matrix.build_type == 'Debug' && matrix.python_version == '3.11' && matrix.arch == 'x64' }}
+      run: |
+        set -euo pipefail
+        mkdir -p coverage/html
+
+        gcovr_args=(
+          --root "${GITHUB_WORKSPACE}"
+          --object-directory "${BUILD_DIR}/src"
+          # CMake compiler-id probes are not test targets and produce noisy gcov warnings.
+          --gcov-exclude "${BUILD_DIR}/CMakeFiles/.*/CompilerId.*/.*"
+          --exclude-directories "${BUILD_DIR}/CMakeFiles"
+          --filter "src/"
+          --exclude "tests/.*"
+        )
+
+        gcovr "${gcovr_args[@]}" --txt --output coverage/summary.txt --print-summary | tee coverage/totals.txt
+        gcovr "${gcovr_args[@]}" --xml-pretty --output coverage/cobertura.xml
+        gcovr "${gcovr_args[@]}" --html-details --output coverage/html/index.html
+
+    - name: Publish coverage summary
+      if: ${{ matrix.build_type == 'Debug' && matrix.python_version == '3.11' && matrix.arch == 'x64' }}
+      run: |
+        set -euo pipefail
+        {
+          echo "## CTest coverage"
+          echo
+          echo "Native coverage was generated from the existing Ubuntu Debug x64 Python 3.11 CTest matrix entry."
+          echo
+          echo "### Totals"
+          echo '```'
+          cat coverage/totals.txt
+          echo '```'
+          echo
+          echo "Download the \`isaacteleop-coverage-ubuntu-debug\` artifact for the HTML report and \`coverage/cobertura.xml\`."
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Upload coverage artifact
+      if: ${{ matrix.build_type == 'Debug' && matrix.python_version == '3.11' && matrix.arch == 'x64' }}
+      uses: actions/upload-artifact@v6
+      with:
+        name: isaacteleop-coverage-ubuntu-debug
+        path: |
+          coverage/summary.txt
+          coverage/totals.txt
+          coverage/cobertura.xml
+          coverage/html
+        if-no-files-found: error
+        retention-days: 14
 
     - name: Package viz test binaries (Release, py3.11 only)
       # GPU [gpu]-tagged tests run separately on a self-hosted GPU runner
@@ -144,10 +204,10 @@ jobs:
         mkdir -p viz-tests-pkg
         # Glob all viz_*_tests executables (covers viz_core_tests today, and
         # viz_layers_tests / viz_session_tests / viz_xr_tests as they ship).
-        find build/src/viz -name 'viz_*_tests' -type f -executable \
+        find "${BUILD_DIR}/tests/cpp/viz" -name 'viz_*_tests' -type f -executable \
           -exec cp -v {} viz-tests-pkg/ \;
         if ! ls viz-tests-pkg/viz_*_tests >/dev/null 2>&1; then
-          echo "No viz test binaries found under build/src/viz/"
+          echo "No viz test binaries found under ${BUILD_DIR}/tests/cpp/viz/"
           exit 1
         fi
         tar -cvzf viz-tests.tar.gz -C viz-tests-pkg .
@@ -159,11 +219,11 @@ jobs:
         name: viz-tests-${{ matrix.arch }}
         path: viz-tests.tar.gz
         if-no-files-found: error
-        retention-days: 1
+        retention-days: 7
 
     - name: Install (Release only)
       if: matrix.build_type == 'Release'
-      run: cmake --install build
+      run: cmake --install "${BUILD_DIR}"
 
     - name: Repair wheel tags with auditwheel (Release only)
       if: matrix.build_type == 'Release'
@@ -200,7 +260,7 @@ jobs:
       with:
         name: isaacteleop-install-release-${{ matrix.arch }}-py${{ matrix.python_version }}
         path: isaacteleop-install.tar
-        retention-days: 1
+        retention-days: 7
     - name: Upload wheel artifacts
       if: matrix.build_type == 'Release'
       uses: actions/upload-artifact@v6
@@ -208,7 +268,96 @@ jobs:
         name: isaacteleop-wheels-${{ matrix.arch }}-py${{ matrix.python_version }}
         path: install/wheels/*.whl
         if-no-files-found: error
-        retention-days: 1
+        retention-days: 7
+
+  pip-editable-install:
+    # Validates the scikit-build-core (PEP 517/660) from-source install path added
+    # for issue #735: an sdist build and `pip install -e .` over the root
+    # pyproject.toml, which drives the same top-level CMake build as build-ubuntu.
+    # This guards the standards-based path so it does not rot. Single config
+    # (x64 / Python 3.11 / Release) is sufficient -- the backend just wraps CMake,
+    # already matrix-tested above. No CUDA/Vulkan here, so BUILD_VIZ stays auto-OFF.
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Install uv
+      uses: ./.github/actions/setup-uv
+
+    - name: Install Apt dependencies
+      run: |
+        sudo apt-get update
+        # clang-format-14: the pip build enforces the clang-format gate (no
+        # cmake.define override), so the tool must be present or the build FATALs.
+        sudo apt-get install -y $CORE_APT_DEPS ccache clang-format-14
+
+    - name: Build sdist (validates backend config + metadata)
+      run: |
+        set -euo pipefail
+        uv build --sdist --python 3.11 --out-dir dist
+        ls -la dist
+
+    - name: Editable install
+      run: |
+        set -euo pipefail
+        uv venv --python 3.11 .venv-skbuild
+        # Editable install through scikit-build-core. It drives the same CMake
+        # build, scoped by pyproject.toml (no examples/tests/plugins/clang-format),
+        # and fetches C++ deps via FetchContent.
+        uv pip install --python .venv-skbuild -e .
+
+    - name: Import smoke test
+      run: |
+        set -euo pipefail
+        cat > "${RUNNER_TEMP}/skbuild_smoke.py" <<'PY'
+        import importlib.util
+
+        # (1) ABI check: actually import the compiled pybind11 extensions and the
+        # eager pure-Python packages. `import isaacteleop` also exercises the eager
+        # submodule chain (cloudxr, teleop_session_manager) that the base install
+        # must satisfy with only numpy+pyyaml.
+        import isaacteleop
+        for mod in (
+            "oxr",
+            "deviceio",
+            "deviceio_trackers",
+            "deviceio_session",
+            "schema",
+            "plugin_manager",
+        ):
+            importlib.import_module(f"isaacteleop.{mod}")
+
+        # (2) Completeness check: every top-level subpackage that the classic wheel
+        # ships (minus GPU-only `viz`, which is auto-OFF here) must be PACKAGED.
+        # find_spec locates the package without importing its optional third-party
+        # deps, so a subpackage silently dropped from the build fails loudly here
+        # even though the smoke env installs no extras.
+        expected = [
+            "isaacteleop.mcap",
+            "isaacteleop.rig",
+            "isaacteleop.cloudxr",
+            "isaacteleop.teleop_session_manager",
+            "isaacteleop.retargeters",
+            "isaacteleop.retargeting_engine",
+            "isaacteleop.retargeting_engine_ui",
+            "isaacteleop.haptic_devices",
+        ]
+        missing = [m for m in expected if importlib.util.find_spec(m) is None]
+        assert not missing, f"subpackages missing from the wheel: {missing}"
+
+        print("isaacteleop", isaacteleop.__version__, "imported OK;",
+              "all expected subpackages present")
+        PY
+        # Run the editable install directly with the venv's interpreter -- NOT via
+        # `uv run`, which (with [tool.uv] package = false) would use the project's
+        # own .venv without isaacteleop, rather than .venv-skbuild.
+        .venv-skbuild/bin/python "${RUNNER_TEMP}/skbuild_smoke.py"
 
   test-viz-gpu:
     # Runs [gpu]-tagged Catch2 tests for the Televiz module on a self-hosted
@@ -325,7 +474,7 @@ jobs:
                  --with pytest \
                  --with numpy \
                  --with cupy-cuda12x \
-                 pytest -v --tb=short src/viz/python_tests/
+                 pytest -v --tb=short tests/python/viz/
         }
         if ! run_pytest; then
           echo "::warning::viz_python GPU tests failed on first attempt; retrying after 5s"
@@ -358,9 +507,8 @@ jobs:
     - name: Install Apt dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake libx11-dev clang-format-14 ccache libvulkan-dev glslang-tools \
-          libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev libxkbcommon-dev \
-          libwayland-dev wayland-protocols
+        sudo apt-get install -y $CORE_APT_DEPS \
+          ccache clang-format-14
 
     - name: Install CUDA toolkit
       uses: ./.github/actions/setup-cuda
@@ -409,7 +557,7 @@ jobs:
     strategy:
       fail-fast: ${{ github.event_name == 'pull_request' }}
       matrix:
-        python_version: ['3.10', '3.11', '3.12', '3.13']
+        python_version: ['3.11', '3.12', '3.13']
         arch: ['x64', 'arm64']
 
     steps:
@@ -452,7 +600,7 @@ jobs:
     strategy:
       fail-fast: ${{ github.event_name == 'pull_request' }}
       matrix:
-        python_version: ['3.10', '3.12']
+        python_version: ['3.12']
         arch: ['x64', 'arm64']
 
     steps:
@@ -477,34 +625,46 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v4
 
-    - name: Setup robotic_grounding source bundle
-      id: setup-v2d-src
-      if: ${{ !startsWith(github.ref_name, 'release/') && !startsWith(github.base_ref, 'release/') }}
-      uses: ./.github/actions/setup-v2d-src
-      with:
-        github-token: ${{ secrets.V2D_RETARGETER_TOKEN }}
-
+    # Each ROS distro is tied to its own system Python, so the distro follows
+    # from the matrix entry: Jazzy is 3.12. Humble would be 3.10, which is below
+    # the supported floor.
     - name: Set ROS Distro
       id: ros-distro
       run: |
-        if [ "${{ matrix.python_version }}" = "3.10" ]; then
-          echo "ROS_DISTRO=humble" >> $GITHUB_ENV
-        elif [ "${{ matrix.python_version }}" = "3.12" ]; then
+        if [ "${{ matrix.python_version }}" = "3.12" ]; then
           echo "ROS_DISTRO=jazzy" >> $GITHUB_ENV
+        else
+          echo "::error::No ROS distro mapped to Python ${{ matrix.python_version }}"
+          exit 1
         fi
 
     - name: Setup CloudXR SDK
       uses: ./.github/actions/setup-cloudxr-sdk
-      with:
-        ngc-api-key: ${{ secrets.NGC_TELEOP_CORE_GITHUB_SERVICE_KEY }}
 
     - name: Build teleop_ros2 image
       run: |
         docker build -f examples/teleop_ros2/Dockerfile \
           --build-arg ROS_DISTRO=${{ env.ROS_DISTRO }} \
           --build-arg PYTHON_VERSION=${{ matrix.python_version }} \
-          --build-arg BUNDLE_ROBOTIC_GROUNDING=${{ steps.setup-v2d-src.outputs.bundled || 'false' }} \
           -t teleop_ros2_ref:${{ env.ROS_DISTRO }} .
+
+    - name: Run teleop_ros2 Python unit tests
+      run: |
+        set -euo pipefail
+        TEST_IMAGE="teleop_ros2_ref-tests:${{ env.ROS_DISTRO }}"
+        trap 'docker image rm -f "$TEST_IMAGE" >/dev/null 2>&1 || true' EXIT
+
+        docker build -f examples/teleop_ros2/Dockerfile \
+          --target test \
+          --build-arg ROS_DISTRO=${{ env.ROS_DISTRO }} \
+          --build-arg PYTHON_VERSION=${{ matrix.python_version }} \
+          -t "$TEST_IMAGE" .
+
+        docker run --rm \
+          -e PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+          --entrypoint bash "$TEST_IMAGE" -c \
+          "source /usr/local/bin/teleop-env-setup && \
+           exec uv run --with pytest --no-sync pytest -v --tb=short tests"
 
     # MCAP replay path: feed a recorded fixture through the node
     # (SessionMode.REPLAY, no CloudXR runtime / GPU) across all teleop modes and
@@ -531,10 +691,21 @@ jobs:
           --entrypoint bash teleop_ros2_ref:${{ env.ROS_DISTRO }} -c \
           "source /usr/local/bin/teleop-env-setup && exec /opt/isaacteleop/install/examples/teleop_ros2/cpp/integration_tests/teleop_ros2_mcap_generator '$REPLAY_MCAP'"
 
-        for mode in controller_teleop hand_teleop controller_raw full_body; do
-          echo "Testing mode: $mode"
-          LOG_FILE="${LOG_FILE_BASE}_${mode}.log"
-          RUN_NAME="teleop-ros2-${PROJECT_NAME}-${mode//_/-}"
+        scenarios=(
+          "controller_teleop mode_default"
+          "hand_teleop mode_default"
+          "controller_raw mode_default"
+          "full_body mode_default"
+          "controller_teleop pink_ik"
+          "controller_teleop wuji"
+          "hand_teleop wuji"
+        )
+        for scenario in "${scenarios[@]}"; do
+          read -r mode hand_retargeter <<< "$scenario"
+          scenario_name="${mode}_${hand_retargeter}"
+          echo "Testing mode: $mode (hand_retargeter=$hand_retargeter)"
+          LOG_FILE="${LOG_FILE_BASE}_${scenario_name}.log"
+          RUN_NAME="teleop-ros2-${PROJECT_NAME}-${scenario_name//_/-}"
           verifier_rc=0
           docker_rc=0
           started=false
@@ -547,7 +718,7 @@ jobs:
             -v /tmp:/tmp \
             -e PYTHONUNBUFFERED=1 \
             --entrypoint bash teleop_ros2_ref:${{ env.ROS_DISTRO }} -c \
-            "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync teleop_ros2_node.py --ros-args -p mode:=$mode -p mcap_replay_path:=$REPLAY_MCAP" >/dev/null
+            "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync teleop_ros2_node.py --ros-args -p mode:=$mode -p hand_retargeter:=$hand_retargeter -p mcap_replay_path:=$REPLAY_MCAP" >/dev/null
 
           deadline=$((SECONDS + READINESS_TIMEOUT_SEC))
           while [ "$SECONDS" -lt "$deadline" ]; do
@@ -573,7 +744,7 @@ jobs:
             if docker exec \
               -e PYTHONUNBUFFERED=1 \
               "$RUN_NAME" bash -c \
-              "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync integration_tests/teleop_ros2_topic_verifier.py --mode $mode"; then
+              "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync python -m integration_tests.teleop_ros2_topic_verifier --mode $mode --hand-retargeter $hand_retargeter"; then
               verifier_rc=0
             else
               verifier_rc=$?
@@ -584,11 +755,11 @@ jobs:
           else
             running=$(docker inspect -f '{{.State.Running}}' "$RUN_NAME" 2>/dev/null || echo false)
             if [ "$running" = "true" ]; then
-              echo "Error: TeleopSession did not report readiness within ${READINESS_TIMEOUT_SEC}s in mode $mode"
+              echo "Error: TeleopSession did not report readiness within ${READINESS_TIMEOUT_SEC}s for $scenario_name"
               docker stop --time 5 "$RUN_NAME" >/dev/null || true
               docker wait "$RUN_NAME" >/dev/null || true
             else
-              echo "Error: teleop_ros2_node exited before readiness in mode $mode (exit code $docker_rc)"
+              echo "Error: teleop_ros2_node exited before readiness for $scenario_name (exit code $docker_rc)"
             fi
           fi
 
@@ -604,17 +775,15 @@ jobs:
             exit 1
           fi
           if [ "$verifier_rc" -ne 0 ]; then
-            echo "Error: topic verifier failed in mode $mode (exit code $verifier_rc)"
+            echo "Error: topic verifier failed for $scenario_name (exit code $verifier_rc)"
             exit "$verifier_rc"
           fi
         done
 
-    # Live CloudXR bring-up on the same GPU runner, reusing the teleop_ros2_ref
-    # image built above. Runs the teleop_ros2 node against a real in-process
-    # CloudXR runtime (CloudXRLauncher launches the runtime + WSS proxy) and
-    # asserts clean bring-up. No XR client connects, so the session never starts
-    # and topics are not verified here; this exercises the CloudXR launch path
-    # the replay phase above cannot.
+    # Live CloudXR and managed-plugin bring-up on the same GPU runner, reusing
+    # the teleop_ros2_ref image built above. Runs the teleop_ros2 node against a
+    # real in-process CloudXR runtime and requires the bundled Wuji plugin to
+    # start through TeleopSession. No XR client or glove is required.
     - name: Verify live CloudXR bring-up
       run: |
         set -euo pipefail
@@ -623,17 +792,16 @@ jobs:
         RUN_NAME="teleop-ros2-cloudxr-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.arch }}-${{ env.ROS_DISTRO }}"
         LOG_FILE="/tmp/ros2_cloudxr_output_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${{ matrix.arch }}_${{ env.ROS_DISTRO }}.log"
         MODE="controller_teleop"
+        HAND_RETARGETER="dexpilot"
+        HAND_TRACKING_PLUGIN="wuji"
 
         # The node logs this after CloudXRLauncher returns: runtime ready + WSS
         # proxy up. This is the primary bring-up marker.
         BRINGUP_MARKER="CloudXR runtime and WSS proxy started"
-        # After bring-up the node enters the live session loop. With no XR client
-        # connected it logs the retry warning; if a device/system is present it
-        # logs session start. Either proves the loop is live.
-        LOOP_MARKER_A="TeleopSession started successfully"
-        LOOP_MARKER_B="No XR client connected"
-        # Hard failures from the launcher/runtime.
-        FAIL_RE="CloudXR runtime failed to start|SDK missing libcloudxr.so|CloudXR EULA was not accepted|CloudXR launcher is not running|runtime process exited unexpectedly|WSS proxy thread stopped unexpectedly"
+        SESSION_MARKER="TeleopSession started successfully"
+        PLUGIN_MARKER="WujiGlovePlugin initialized and running"
+        # Hard failures from the launcher, runtime, or plugin lifecycle.
+        FAIL_RE="CloudXR runtime failed to start|SDK missing libcloudxr.so|CloudXR EULA was not accepted|CloudXR launcher is not running|runtime process exited unexpectedly|WSS proxy thread stopped unexpectedly|Plugin process exited immediately|Required plugin .* was not discovered"
 
         BRINGUP_TIMEOUT_SEC=180
         LOOP_TIMEOUT_SEC=30
@@ -657,7 +825,7 @@ jobs:
           -e PYTHONUNBUFFERED=1 \
           -e ACCEPT_CLOUDXR_EULA=Y \
           --entrypoint bash "$IMAGE" -c \
-          "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync teleop_ros2_node.py --ros-args -p mode:=$MODE -p cloudxr_accept_eula:=true" >/dev/null
+          "source /usr/local/bin/teleop-env-setup && exec uv run --no-sync teleop_ros2_node.py --ros-args -p mode:=$MODE -p hand_retargeter:=$HAND_RETARGETER -p hand_tracking_plugin:=$HAND_TRACKING_PLUGIN -p cloudxr_accept_eula:=true" >/dev/null
 
         fail() {
           echo "Error: $1"
@@ -674,7 +842,7 @@ jobs:
           docker logs "$RUN_NAME" > "$LOG_FILE" 2>&1 || true
 
           if grep -Eq "$FAIL_RE" "$LOG_FILE"; then
-            fail "CloudXR runtime/launcher reported a fatal error during bring-up"
+            fail "live bring-up reported a fatal error"
           fi
           if grep -qF "$BRINGUP_MARKER" "$LOG_FILE"; then
             bringup=true
@@ -695,30 +863,33 @@ jobs:
         fi
         echo "CloudXR runtime + WSS proxy came up."
 
-        # Phase 2: confirm the node entered the live session loop.
-        loop=false
+        # Phase 2: require both the live session and managed Wuji plugin.
+        ready=false
         deadline=$((SECONDS + LOOP_TIMEOUT_SEC))
         while [ "$SECONDS" -lt "$deadline" ]; do
           docker logs "$RUN_NAME" > "$LOG_FILE" 2>&1 || true
           if grep -Eq "$FAIL_RE" "$LOG_FILE"; then
-            fail "CloudXR runtime/launcher reported a fatal error after bring-up"
+            fail "live bring-up reported a fatal error after CloudXR startup"
           fi
-          if grep -qF "$LOOP_MARKER_A" "$LOG_FILE" || grep -qF "$LOOP_MARKER_B" "$LOG_FILE"; then
-            loop=true
+          if grep -qF "$SESSION_MARKER" "$LOG_FILE" && grep -qF "$PLUGIN_MARKER" "$LOG_FILE"; then
+            ready=true
             break
           fi
           running=$(docker inspect -f '{{.State.Running}}' "$RUN_NAME" 2>/dev/null || echo false)
           if [ "$running" != "true" ]; then
             rc=$(docker inspect -f '{{.State.ExitCode}}' "$RUN_NAME" 2>/dev/null || echo 1)
-            fail "node exited before entering the live session loop (exit code $rc)"
+            fail "node exited before the live session and Wuji plugin started (exit code $rc)"
           fi
           sleep "$POLL_INTERVAL_SEC"
         done
 
-        if [ "$loop" != true ]; then
-          fail "node did not enter the live session loop within ${LOOP_TIMEOUT_SEC}s"
+        if [ "$ready" != true ]; then
+          fail "live session and Wuji plugin did not start within ${LOOP_TIMEOUT_SEC}s"
         fi
-        echo "Node entered the live session loop."
+        if ! docker exec "$RUN_NAME" pgrep -f '(^|/)wuji_glove_plugin( |$)' >/dev/null; then
+          fail "Wuji plugin process is not running after startup"
+        fi
+        echo "Live session and managed Wuji plugin started."
 
         # Phase 3: soak. The node calls launcher.health_check() every loop, so a
         # dead runtime/WSS proxy would crash it. Surviving the soak with no fatal
@@ -726,18 +897,21 @@ jobs:
         sleep "$SOAK_SEC"
         docker logs "$RUN_NAME" > "$LOG_FILE" 2>&1 || true
         if grep -Eq "$FAIL_RE" "$LOG_FILE"; then
-          fail "CloudXR runtime/launcher reported a fatal error during soak"
+          fail "live bring-up reported a fatal error during soak"
         fi
         running=$(docker inspect -f '{{.State.Running}}' "$RUN_NAME" 2>/dev/null || echo false)
         if [ "$running" != "true" ]; then
           rc=$(docker inspect -f '{{.State.ExitCode}}' "$RUN_NAME" 2>/dev/null || echo 1)
           fail "node exited during the ${SOAK_SEC}s soak (exit code $rc)"
         fi
+        if ! docker exec "$RUN_NAME" pgrep -f '(^|/)wuji_glove_plugin( |$)' >/dev/null; then
+          fail "Wuji plugin process exited during the ${SOAK_SEC}s soak"
+        fi
 
         docker stop --time 5 "$RUN_NAME" >/dev/null || true
         echo "===== teleop_ros2 (live) container log ====="
         cat "$LOG_FILE" 2>/dev/null || echo "No log captured"
-        echo "Live CloudXR bring-up verified for mode $MODE (${{ env.ROS_DISTRO }}, ${{ matrix.arch }})."
+        echo "Live CloudXR and Wuji plugin bring-up verified for mode $MODE (${{ env.ROS_DISTRO }}, ${{ matrix.arch }})."
 
   # These are the actual dependency jobs for publish-wheel. publish-wheel
   # depends only on wheel-gate so the dependency list lives in one place, while

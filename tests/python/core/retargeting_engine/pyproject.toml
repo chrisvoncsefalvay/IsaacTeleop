@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[project]
+name = "isaacteleop-retargeting-engine"
+version = "0.0.0"  # Internal tests - not versioned
+description = "Retargeting engine type system for Isaac Teleop"
+requires-python = ">=3.11,<3.14"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "mypy",
+    "numpy",
+    "scipy",
+    "types-PyYAML",
+    "scipy-stubs",
+]
+test = [
+    "pytest",
+    "numpy",
+    "scipy",
+]
+# Mirrors src/core/python/requirements-grounding.txt. The Sharpa unit test
+# imports robotic_grounding (staged into PYTHONPATH from the wheel build);
+# its runtime deps come from this extra.
+grounding = [
+    "numpy",
+    "scipy>=1.15.0",
+    "torch>=2.7.0",
+    "trimesh",
+    "viser",
+    "pin>=2.7",
+    "pin-pink>=4.0",
+    "loop-rate-limiters",
+    "daqp",
+]
+# Mirrors src/core/python/requirements-wuji.txt. Installed for the Wuji unit
+# test unless -DTEST_WUJI_RETARGETER=OFF.
+wuji = [
+    "wuji-sdk[retarget]==2026.7.14",
+    "pin>=2.7.0",
+    "cmeel-urdfdom<5",
+    "cmeel-tinyxml2<11",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Prevent pytest from recursing into parent directories
+norecursedirs = [".git", ".venv", "build", "dist", "*.egg", "__pycache__"]
+
+[tool.mypy]
+# This check's declared scope is src/python/isaacteleop/retargeting_engine (see
+# ../CMakeLists.txt). Now that the engine sits inside the isaacteleop package
+# tree, its `isaacteleop.*` imports resolve to real sibling source rather than
+# to a separately-named copy, so mypy would otherwise report errors in
+# cloudxr/ and teleop_session_manager/ too. Follow those imports for their
+# types, but keep their (pre-existing) errors out of this test.
+follow_imports = "silent"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+
+# Show error codes
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+
+# Exclude test files from strict checking
+exclude = [
+    "test_.*",
+]
+
+# `IHapticDevice.accepted_type()` already returns `TensorGroupType`, so the
+# `cast()` in haptic_sink.py is redundant -- visible only now that engine and
+# haptic_devices are checked as one package instead of two module identities.
+# Deleting the cast is the real fix; this override holds until that follow-up,
+# so the move leaves the staged tree byte-for-byte identical.
+[[tool.mypy.overrides]]
+module = "isaacteleop.retargeting_engine.deviceio_source_nodes.haptic_sink"
+disable_error_code = ["redundant-cast"]

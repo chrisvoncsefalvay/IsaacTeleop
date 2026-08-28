@@ -2,7 +2,7 @@ Device Trackers
 ===============
 
 Trackers (defined in :code-dir:`src/core/deviceio_trackers`) are the consumer-side API for reading device
-data from an active :code-file:`DeviceIOSession <src/core/deviceio_session/cpp/inc/deviceio/deviceio_session.hpp>`.
+data from an active :code-file:`DeviceIOSession <src/core/deviceio_session/cpp/inc/deviceio_session/deviceio_session.hpp>`.
 Each tracker manages one logical device, queries the OpenXR runtime every frame,
 and exposes the latest sample through typed ``get_*()`` accessors.
 
@@ -11,17 +11,19 @@ There are two categories of trackers:
 **OpenXR-direct trackers** -- read pose and input data through standard OpenXR
 APIs (``xrLocateSpace``, ``xrSyncActions``, etc.):
 
-- :code-file:`HeadTracker <src/core/deviceio_trackers/cpp/inc/deviceio/head_tracker.hpp>` -- HMD head pose
-- :code-file:`HandTracker <src/core/deviceio_trackers/cpp/inc/deviceio/hand_tracker.hpp>` -- articulated hand joints (left and right)
-- :code-file:`ControllerTracker <src/core/deviceio_trackers/cpp/inc/deviceio/controller_tracker.hpp>` -- controller poses and button/axis inputs (left and right)
-- :code-file:`FullBodyTrackerPico <src/core/deviceio_trackers/cpp/inc/deviceio/full_body_tracker_pico.hpp>` -- 24-joint full body pose (PICO ``XR_BD_body_tracking``)
+- :code-file:`HeadTracker <src/core/deviceio_trackers/cpp/inc/deviceio_trackers/head_tracker.hpp>` -- HMD head pose
+- :code-file:`HandTracker <src/core/deviceio_trackers/cpp/inc/deviceio_trackers/hand_tracker.hpp>` -- articulated hand joints (left and right)
+- :code-file:`ControllerTracker <src/core/deviceio_trackers/cpp/inc/deviceio_trackers/controller_tracker.hpp>` -- controller poses and button/axis inputs (left and right)
+- :code-file:`FullBodyTracker <src/core/deviceio_trackers/cpp/inc/deviceio_trackers/full_body_tracker.hpp>` -- vendor-agnostic 24-joint full body pose; default vendor reads the PICO ``XR_BD_body_tracking`` extension (see `Vendor Selection`_)
 
 **SchemaTracker-based trackers** -- create new device type by defining a FlatBuffer schema and
 reading it from OpenXR tensor collections via the
 :code-file:`SchemaTracker <src/core/live_trackers/cpp/inc/live_trackers/schema_tracker.hpp>` utility.
 
-- :code-file:`FrameMetadataTrackerOak <src/core/deviceio_trackers/cpp/inc/deviceio/frame_metadata_tracker_oak.hpp>` -- per-stream frame metadata from OAK cameras
-- :code-file:`Generic3AxisPedalTracker <src/core/deviceio_trackers/cpp/inc/deviceio/generic_3axis_pedal_tracker.hpp>` -- foot pedal axis values
+- :code-file:`FrameMetadataTrackerOak <src/core/deviceio_trackers/trackers.toml>` -- frame metadata for one OAK camera stream (generated)
+- :code-file:`Generic3AxisPedalTracker <src/core/deviceio_trackers/trackers.toml>` -- foot pedal axis values (generated)
+- :code-file:`JointStateTracker <src/core/deviceio_trackers/trackers.toml>` -- named joint-space device state (leader arms, exoskeletons, gloves, ...) (generated)
+- :code-file:`Se3Tracker <src/core/deviceio_trackers/trackers.toml>` -- generic SE3 (6-DoF) pose sources (tracker pucks, mocap rigid bodies, logical trackers) (generated)
 
 All trackers follow the same lifecycle:
 
@@ -42,43 +44,94 @@ Data Schema Convention
 ----------------------
 
 Every tracker's data is defined by a FlatBuffers schema under
-:code-dir:`src/core/schema/fbs`. Each schema follows a three-tier convention:
+:code-dir:`src/core/schema/fbs`. Each schema follows a two-tier convention:
 
 .. code-block:: idl
 
-   // 1. Inner data table -- the actual payload
+   // 1. Payload table -- the actual data, and what trackers hand to consumers.
    table Xxx {
        field_a: SomeType (id: 0);
        field_b: AnotherType (id: 1);
    }
 
-   // 2. Tracked wrapper -- used by the in-memory tracker API.
-   //    data is null when the tracked entity is inactive.
-   table XxxTracked {
-       data: Xxx (id: 0);
-   }
-
-   // 3. Record wrapper -- used as the MCAP recording root type.
+   // 2. Record wrapper -- used as the MCAP recording root type.
    //    Adds a DeviceDataTimestamp alongside the payload.
    table XxxRecord {
        data: Xxx (id: 0);
        timestamp: DeviceDataTimestamp (id: 1);
    }
 
+.. _tracked-sub-channel:
+
+The ``_tracked`` recording sub-channel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A tracker that reads from a tensor collection can see **several samples per
+frame**, and it records both views of that: every sample goes to ``<channel>``,
+while only the final sample of each ``update()`` -- the one the live consumer
+actually observed -- goes to ``<channel>_tracked``. Both carry the same
+``XxxRecord`` root type; they differ only in which samples reach them.
+
+Replay reads ``<channel>_tracked`` **exclusively**, so that a replayed session
+yields exactly the values the live session did rather than the intermediate
+samples. The per-sample channel is there for offline analysis.
+
+Both names come from :code-file:`src/core/deviceio_trackers/defaults.toml` and
+apply to every generated pull tracker:
+
+.. code-block:: toml
+
+   mcap_channels = ["%channel%", "%channel%_tracked"]
+   replay_channels = ["%channel%_tracked"]
+
+A manifest entry that overrides ``mcap_channels`` must keep the ``_tracked``
+entry and list it in ``replay_channels``. Recording still succeeds without it,
+but the resulting file cannot be replayed.
+
    root_type XxxRecord;
 
-- **Inner data table** (e.g. ``HeadPose``, ``HandPose``, ``ControllerSnapshot``) --
-  contains the device-specific fields. All fields are present when the parent
-  wrapper's ``data`` pointer is non-null.
+- **Payload table** (e.g. ``HeadPose``, ``HandPose``, ``ControllerSnapshot``) --
+  contains the device-specific fields. All fields are present whenever the table
+  itself is present.
 
-- **Tracked wrapper** (e.g. ``HeadPoseTracked``) -- wraps the inner data in an
-  optional ``data`` field. The in-memory ``get_*()`` accessors return a reference
-  to this wrapper. When ``data`` is ``nullptr`` (C++) or ``None`` (Python), the
-  device is inactive or no sample has arrived yet.
-
-- **Record wrapper** (e.g. ``HeadPoseRecord``) -- wraps the inner data plus a
+- **Record wrapper** (e.g. ``HeadPoseRecord``) -- wraps the payload plus a
   ``DeviceDataTimestamp``. This is the ``root_type`` written to MCAP channels by
-  the recorder via ``serialize_all()``.
+  the recorder.
+
+Reading a payload
+~~~~~~~~~~~~~~~~~
+
+The ``get_*()`` accessors hand out the payload table itself as an owning handle
+over the encoded bytes -- ``Serialized<HeadPose>`` in C++
+(:code-file:`src/core/schema/cpp/inc/schema/serialized.hpp`), a read-only view
+class (``HeadPose``) in Python. Reads go straight into the buffer, so there is no
+unpack step and joint arrays come back as zero-copy NumPy views.
+
+An **empty handle is the absent payload**: the device is inactive, no sample has
+arrived yet, or replay hit a gap. Test it with ``if (handle)`` in C++; in Python
+the accessor returns ``None``.
+
+Each ``session.update()`` publishes a *new* buffer rather than refilling the
+previous one, so a handle read this frame keeps its values after the next update.
+
+To build a payload from Python, pass every field to its constructor -- the view
+classes expose no setters.
+
+.. warning::
+
+   Immutability is a **contract, not an enforcement**. The joint-array properties
+   hand out *writable* NumPy views, because NumPy cannot export a read-only array
+   over DLPack before 2.1. Writing through one changes what every holder of that
+   buffer sees, including handles read on earlier frames. Copy first if you mean
+   to modify.
+
+.. note::
+
+   ``MessageChannelMessagesTracked`` wraps its payload in a table, because that
+   payload is a **list** and something has to hold the vector. Once a tracker has
+   run one ``update()`` the handle is non-empty for the rest of the session, and
+   an empty ``data`` vector -- not an empty handle -- means no messages arrived
+   this frame. Before that first update the handle is empty like any other.
 
 Shared Types
 ~~~~~~~~~~~~
@@ -131,8 +184,8 @@ Tracks the HMD head pose via the OpenXR view space.
 - Record channels: ``head`` | MCAP schema: ``core.HeadPoseRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_head.cpp`
-  - :code-file:`src/core/schema_tests/python/test_head.py`
+  - :code-file:`tests/cpp/core/schema/test_head.cpp`
+  - :code-file:`tests/python/core/schema/test_head.py`
 
 - Examples:
 
@@ -151,8 +204,8 @@ Tracks articulated hand joints (26 joints per hand, following the OpenXR
 - Record channels: ``left_hand``, ``right_hand`` | MCAP schema: ``core.HandPoseRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_hand.cpp`
-  - :code-file:`src/core/schema_tests/python/test_hand.py`
+  - :code-file:`tests/cpp/core/schema/test_hand.cpp`
+  - :code-file:`tests/python/core/schema/test_hand.py`
   - :code-file:`examples/oxr/python/test_synthetic_hands.py`
 
 - Examples:
@@ -173,8 +226,8 @@ axis inputs. Uses standard OpenXR action bindings.
 - Record channels: ``left_controller``, ``right_controller`` | MCAP schema: ``core.ControllerSnapshotRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_controller.cpp`
-  - :code-file:`src/core/schema_tests/python/test_controller.py`
+  - :code-file:`tests/cpp/core/schema/test_controller.cpp`
+  - :code-file:`tests/python/core/schema/test_controller.py`
   - :code-file:`examples/oxr/python/test_controller_tracker.py`
 
 - Examples:
@@ -183,37 +236,57 @@ axis inputs. Uses standard OpenXR action bindings.
   - :code-file:`examples/teleop/python/locomotion_retargeting_example.py`
   - :code-file:`examples/teleop/python/gripper_retargeting_example_simple.py`
 
-FullBodyTrackerPico
-~~~~~~~~~~~~~~~~~~~
+FullBodyTracker
+~~~~~~~~~~~~~~~
 
-Tracks 24 body joints on PICO devices using the ``XR_BD_body_tracking``
-extension.
+Tracks 24 body joints through a vendor-selected backend. The tracker itself is
+a vendor-agnostic marker and carries no vendor or live/replay state: a live
+session picks the backend via ``VendorConfig`` (see `Vendor Selection`_), and
+replay reads the recorded ``full_body`` channel regardless of which vendor
+produced it. When no vendor is selected, the default vendor ``body.pico-xr``
+reads the PICO ``XR_BD_body_tracking`` extension directly.
 
 - Schema: :code-file:`src/core/schema/fbs/full_body.fbs`
-- C++ header: ``#include <deviceio/full_body_tracker_pico.hpp>``
-- Python import: ``from isaacteleop.deviceio import FullBodyTrackerPico``
-- Record channels: ``full_body`` | MCAP schema: ``core.FullBodyPosePicoRecord``
+- C++ header: ``#include <deviceio_trackers/full_body_tracker.hpp>``
+- Python import: ``from isaacteleop.deviceio import FullBodyTracker``
+- Record channels: ``full_body`` | MCAP schema: ``core.FullBodyPoseRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_full_body.cpp`
-  - :code-file:`src/core/schema_tests/python/test_full_body.py`
+  - :code-file:`tests/cpp/core/schema/test_full_body.cpp`
+  - :code-file:`tests/python/core/schema/test_full_body.py`
   - :code-file:`examples/oxr/python/test_full_body_tracker.py`
+
+- Examples:
+
+  - :code-file:`examples/schemaio/full_body_printer.cpp`
+  - :code-file:`examples/mcap_record_replay/cpp/record_full_body.cpp`
+  - :code-file:`examples/mcap_record_replay/python/live_full_body.py`
+  - :code-file:`examples/mcap_record_replay/python/record_full_body.py`
+  - :code-file:`examples/mcap_record_replay/python/replay_full_body.py`
+
+.. note::
+
+   ``FullBodyTrackerPico`` remains available as a deprecated alias for
+   ``FullBodyTracker`` so existing scripts run unchanged.
 
 FrameMetadataTrackerOak
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Multi-channel tracker for per-frame metadata from OAK camera streams.
-Uses the :code-file:`SchemaTracker <src/core/live_trackers/cpp/inc/live_trackers/schema_tracker.hpp>`
+Per-frame metadata for a **single** OAK camera stream. Create one tracker per
+stream, passing the tensor collection the plugin publishes that stream under --
+``{collection_prefix}/{StreamName}``, e.g. ``"oak_camera/Color"``. Uses the
+:code-file:`SchemaTracker <src/core/live_trackers/cpp/inc/live_trackers/schema_tracker.hpp>`
 utility internally.
 
 - Schema: :code-file:`src/core/schema/fbs/oak.fbs`
-- C++ header: ``#include <deviceio/frame_metadata_tracker_oak.hpp>``
+- Manifest: :code-file:`src/core/deviceio_trackers/trackers.toml` (``frame_metadata_oak``)
+- C++ header: ``#include <deviceio_trackers/frame_metadata_tracker_oak.hpp>``
 - Python import: ``from isaacteleop.deviceio import FrameMetadataTrackerOak``
-- Record channels: one per configured stream (e.g. ``Color``, ``MonoLeft``) | MCAP schema: ``core.FrameMetadataOakRecord``
+- Record channels: ``oak``, ``oak_tracked`` | MCAP schema: ``core.FrameMetadataOakRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_oak.cpp`
-  - :code-file:`src/core/schema_tests/python/test_camera.py`
+  - :code-file:`tests/cpp/core/schema/test_oak.cpp`
+  - :code-file:`tests/python/core/schema/test_camera.py`
   - :code-file:`examples/oxr/python/test_oak_camera.py`
 
 - Examples:
@@ -233,8 +306,8 @@ utility internally.
 - Record channels: ``pedals`` | MCAP schema: ``core.Generic3AxisPedalOutputRecord``
 - Tests:
 
-  - :code-file:`src/core/schema_tests/cpp/test_pedals.cpp`
-  - :code-file:`src/core/schema_tests/python/test_pedals.py`
+  - :code-file:`tests/cpp/core/schema/test_pedals.cpp`
+  - :code-file:`tests/python/core/schema/test_pedals.py`
 
 - Examples:
 
@@ -245,6 +318,57 @@ utility internally.
 
    The Python method is named ``get_pedal_data()`` (instead of the C++
    ``get_data()``).
+
+.. _vendor-selection:
+
+Vendor Selection
+----------------
+
+Some trackers are **vendor-agnostic markers**: the tracker declares *what*
+device data it represents, while a live session chooses *which* backend
+("vendor") produces that data. This mirrors how live-vs-replay is chosen at the
+session level -- the same tracker instance works across vendors and across live
+and replay. ``FullBodyTracker`` is currently the only vendored tracker; its
+default vendor ``body.pico-xr`` reads the PICO ``XR_BD_body_tracking``
+extension.
+
+Select a vendor by passing a ``VendorConfig`` to both
+``DeviceIOSession.get_required_extensions()`` and ``DeviceIOSession.run()``. A
+``VendorConfig`` maps tracker instances to a ``TrackerVendor(id, params)``,
+where ``id`` selects the backend from the live factory's vendor registry and
+``params`` carries free-form string key/value options for it. Trackers left out
+of the config use their default vendor. Vendor selections on non-vendored
+trackers, and unknown vendor ids, are rejected at session construction.
+
+.. code-block:: python
+
+   import isaacteleop.deviceio as deviceio
+
+   body = deviceio.FullBodyTracker()
+
+   # Select the backend for the vendored tracker (default shown explicitly).
+   vendor_config = deviceio.VendorConfig([
+       (body, deviceio.TrackerVendor("body.pico-xr")),
+   ])
+
+   required_extensions = deviceio.DeviceIOSession.get_required_extensions(
+       [body], vendor_config
+   )
+   with deviceio.DeviceIOSession.run(
+       [body], handles, None, vendor_config
+   ) as session:
+       ...
+
+Replay is always vendor-neutral: the replay full-body impl reads the recorded
+``full_body`` channel regardless of which live vendor produced it, so
+``VendorConfig`` applies to live sessions only. The vendor registry is open for
+additional pre-built plugin vendors without changing the tracker marker.
+
+When driving devices through the higher-level teleop session manager, vendor
+selection is carried on the DeviceIO source itself via its ``vendor`` argument
+(e.g. ``FullBodySource(name="full_body", vendor=deviceio.TrackerVendor("body.pico-xr"))``),
+so it travels with the pipeline into both extension discovery and session
+construction; see :doc:`../getting_started/teleop_session`.
 
 .. _tracker-usage-example:
 

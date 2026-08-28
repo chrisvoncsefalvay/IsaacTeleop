@@ -32,16 +32,26 @@
  */
 
 import {
+  getGridValidationError,
+  getGridValidationMessageForConnect,
+  getResolutionValidationError,
+  getResolutionValidationMessageForConnect,
+  validateDepthReprojectionGrid,
+  validatePerEyeResolution,
+} from '@nvidia/cloudxr';
+
+import {
   detectDeviceProfileId,
+  type DeviceProfileId,
   getDeviceProfile,
   resolveDeviceProfileId,
-  type DeviceProfileId,
 } from '@helpers/DeviceProfiles';
 import {
   type AutoRefreshMode,
   loadPerProject,
   parseAutoRefreshMode,
   parseControlPanelPosition,
+  parseStreamTestMode,
   ReactUIConfig,
   savePerProject,
 } from '@helpers/react/utils';
@@ -59,19 +69,18 @@ import {
   setSelectValueIfAvailable,
   setupCertificateAcceptanceLink,
 } from '@helpers/utils';
+
 import { URL_PARAMS } from './config/params';
 import { seedsFromParams } from './config/resolve';
-import {
-  getGridValidationError,
-  getGridValidationMessageForConnect,
-  getResolutionValidationError,
-  getResolutionValidationMessageForConnect,
-  validateDepthReprojectionGrid,
-  validatePerEyeResolution,
-} from '@nvidia/cloudxr';
+import type { ReplayPacing } from './xrInputRecorder';
 
 /** Full config: CloudXR connection settings + React UI options. */
-type AppConfig = CloudXRConfig & ReactUIConfig;
+type AppConfig = CloudXRConfig &
+  ReactUIConfig & {
+    showTrace: boolean;
+    showRecordingControls: boolean;
+    replayPacing: ReplayPacing;
+  };
 
 /**
  * localStorage key for the teleop-start countdown. Owned by the countdown feature in
@@ -164,8 +173,15 @@ export class CloudXR2DUI {
   private mediaAddressInput!: HTMLInputElement;
   /** Input field for media server port */
   private mediaPortInput!: HTMLInputElement;
+  /** Dropdown selecting the pre-stream network test mode (off / warn / block) */
+  private streamTestModeSelect!: HTMLSelectElement;
+  /** Input field for the network test window length in seconds */
+  private streamTestDurationSecondsInput!: HTMLInputElement;
   /** Dropdown for controller model visibility (show / hide) */
   private controllerModelVisibilitySelect!: HTMLSelectElement;
+  private showTraceInXRSelect!: HTMLSelectElement;
+  private showRecordingControlsSelect!: HTMLSelectElement;
+  private replayPacingSelect!: HTMLSelectElement;
   /** Skip client CloudXR `render` (headless: client blit off; tracking on) */
   private headlessInput!: HTMLInputElement;
   /** When to reload the page after the XR session ends (never / clean / any) */
@@ -280,15 +296,17 @@ export class CloudXR2DUI {
     const boolFromStorage = (raw: string) =>
       raw === 'true' ? true : raw === 'false' ? false : undefined;
     const panelHidden = loadPerProject<boolean>(
-      'panelHiddenAtStart', this.teleopPath,
+      'panelHiddenAtStart',
+      this.teleopPath,
       boolFromStorage,
-      settings.panelHiddenAtStart ?? false,
+      settings.panelHiddenAtStart ?? false
     );
     this.panelHiddenAtStartSelect.value = String(panelHidden);
     const headless = loadPerProject<boolean>(
-      'headless', this.teleopPath,
+      'headless',
+      this.teleopPath,
       boolFromStorage,
-      settings.headless ?? false,
+      settings.headless ?? false
     );
     this.headlessInput.checked = headless;
     this.applyHeadlessImmersiveDropdown();
@@ -343,7 +361,8 @@ export class CloudXR2DUI {
       const option = document.createElement('option');
       option.value = entry.hash;
       const isCurrent = entry.hash === currentHash;
-      option.textContent = INDENT.repeat(entry.depth) + entry.label + (isCurrent ? '  (current)' : '');
+      option.textContent =
+        INDENT.repeat(entry.depth) + entry.label + (isCurrent ? '  (current)' : '');
       if (isCurrent) option.disabled = true;
       select.appendChild(option);
     }
@@ -458,9 +477,16 @@ export class CloudXR2DUI {
     this.certLink = this.getElement<HTMLAnchorElement>('certLink');
     this.mediaAddressInput = this.getElement<HTMLInputElement>('mediaAddress');
     this.mediaPortInput = this.getElement<HTMLInputElement>('mediaPort');
+    this.streamTestModeSelect = this.getElement<HTMLSelectElement>('streamTestMode');
+    this.streamTestDurationSecondsInput = this.getElement<HTMLInputElement>(
+      'streamTestDurationSeconds'
+    );
     this.controllerModelVisibilitySelect = this.getElement<HTMLSelectElement>(
       'controllerModelVisibility'
     );
+    this.showTraceInXRSelect = this.getElement<HTMLSelectElement>('showTraceInXR');
+    this.showRecordingControlsSelect = this.getElement<HTMLSelectElement>('showRecordingControls');
+    this.replayPacingSelect = this.getElement<HTMLSelectElement>('replayPacing');
     this.headlessInput = this.getElement<HTMLInputElement>('cloudxrHeadless');
     this.autoRefreshModeSelect = this.getElement<HTMLSelectElement>('cloudxrAutoRefreshMode');
     this.teleopModeSubtitle = this.getElement<HTMLElement>('teleopModeSubtitle');
@@ -517,6 +543,14 @@ export class CloudXR2DUI {
       enableTexSubImage2D: false,
       useQuestColorWorkaround: false,
       hideControllerModel: false,
+      showTrace: false,
+      showRecordingControls: false,
+      replayPacing: 'time',
+      // Off by default: the test holds the session in Connecting for its whole window,
+      // and a teleop operator connecting to a robot should not be gated on it. Opt in
+      // via the settings panel or ?streamTestMode=warn when diagnosing a link.
+      streamTestMode: 'off',
+      streamTestDurationSeconds: 5,
       headless: false,
       autoRefreshMode: 'clean',
       teleopPath: DEFAULT_TELEOP_PATH,
@@ -558,7 +592,12 @@ export class CloudXR2DUI {
       { el: this.xrOffsetZInput, key: 'xrOffsetZ' },
       { el: this.mediaAddressInput, key: 'mediaAddress' },
       { el: this.mediaPortInput, key: 'mediaPort' },
+      { el: this.streamTestModeSelect, key: 'streamTestMode' },
+      { el: this.streamTestDurationSecondsInput, key: 'streamTestDurationSeconds' },
       { el: this.controllerModelVisibilitySelect, key: 'controllerModelVisibility' },
+      { el: this.showTraceInXRSelect, key: 'showTraceInXR' },
+      { el: this.showRecordingControlsSelect, key: 'showRecordingControls' },
+      { el: this.replayPacingSelect, key: 'replayPacing' },
       { el: this.autoRefreshModeSelect, key: 'autoRefreshMode' },
     ];
   }
@@ -797,7 +836,13 @@ export class CloudXR2DUI {
     addListener(this.mediaAddressInput, 'change', updateConfig);
     addListener(this.mediaPortInput, 'input', updateConfig);
     addListener(this.mediaPortInput, 'change', updateConfig);
+    addListener(this.streamTestModeSelect, 'change', updateConfig);
+    addListener(this.streamTestDurationSecondsInput, 'input', updateConfig);
+    addListener(this.streamTestDurationSecondsInput, 'change', updateConfig);
     addListener(this.controllerModelVisibilitySelect, 'change', updateConfig);
+    addListener(this.showTraceInXRSelect, 'change', updateConfig);
+    addListener(this.showRecordingControlsSelect, 'change', updateConfig);
+    addListener(this.replayPacingSelect, 'change', updateConfig);
     addListener(this.headlessInput, 'change', () => {
       savePerProject('headless', this.teleopPath, this.headlessInput.checked ? 'true' : 'false');
       this.applyHeadlessImmersiveDropdown();
@@ -814,9 +859,7 @@ export class CloudXR2DUI {
     // Headset on-screen keyboards sometimes lack a minus key, so offsets can't be typed
     // negative. Each ± button (data-target = input id) flips its field's sign. Dispatch
     // 'change' so the existing offset listeners (updateConfiguration + localStorage) run.
-    for (const btn of Array.from(
-      document.querySelectorAll<HTMLButtonElement>('.input-sign-btn')
-    )) {
+    for (const btn of Array.from(document.querySelectorAll<HTMLButtonElement>('.input-sign-btn'))) {
       const targetId = btn.dataset.target;
       if (!targetId) continue;
       const input = document.getElementById(targetId) as HTMLInputElement | null;
@@ -911,9 +954,7 @@ export class CloudXR2DUI {
       reprojectionGridCols,
       reprojectionGridRows
     );
-    const combinedConnectMessage = [connectMessage, gridConnectMessage]
-      .filter(Boolean)
-      .join('\n');
+    const combinedConnectMessage = [connectMessage, gridConnectMessage].filter(Boolean).join('\n');
     if (combinedConnectMessage) {
       this.validationMessageText.textContent = combinedConnectMessage;
       this.validationMessageBox.className = 'validation-message-box show';
@@ -1007,7 +1048,18 @@ export class CloudXR2DUI {
         const v = parseInt(this.mediaPortInput.value, 10);
         return !isNaN(v) ? v : undefined;
       })(),
+      streamTestMode: parseStreamTestMode(
+        this.streamTestModeSelect.value,
+        this.getDefaultConfiguration().streamTestMode ?? 'off'
+      ),
+      streamTestDurationSeconds: (() => {
+        const v = parseInt(this.streamTestDurationSecondsInput.value, 10);
+        return !isNaN(v) ? v : this.getDefaultConfiguration().streamTestDurationSeconds;
+      })(),
       hideControllerModel: this.controllerModelVisibilitySelect.value === 'hide',
+      showTrace: this.showTraceInXRSelect.value === 'true',
+      showRecordingControls: this.showRecordingControlsSelect.value === 'true',
+      replayPacing: this.replayPacingSelect.value === 'frame' ? 'frame' : 'time',
       // See immersiveMode above: when true, callers must start an immersive-vr WebXR session.
       headless: this.headlessInput.checked,
       autoRefreshMode: parseAutoRefreshMode(
@@ -1215,6 +1267,23 @@ export class CloudXR2DUI {
   public hideError(): void {
     if (this.errorMessageBox) {
       this.errorMessageBox.classList.remove('show');
+    }
+  }
+
+  /**
+   * Hides the status box only if it still shows `message`.
+   *
+   * The box is a single shared slot: capability results, CloudXR errors, and
+   * host workstation notices all write to it, and each overwrites the last. A
+   * caller retracting its own message must not blank whatever replaced it --
+   * for example a CloudXR error raised moments earlier, which is reported
+   * imperatively and has no React state to re-render it afterwards.
+   *
+   * @param message - The exact text the caller previously displayed
+   */
+  public hideStatusIfShowing(message: string): void {
+    if (this.errorMessageText?.textContent === message) {
+      this.hideError();
     }
   }
 

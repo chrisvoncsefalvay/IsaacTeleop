@@ -11,19 +11,39 @@ import argparse
 import math
 import sys
 import time
-from typing import Callable
+from collections.abc import Callable
+from functools import partial
 
 import msgpack
 import rclpy
-from geometry_msgs.msg import PoseArray, PoseStamped, TwistStamped
+from constants import (
+    HAND_RETARGETERS,
+    LEFT_SHARPA_WAVE_JOINT_NAMES,
+    LEFT_WUJI_HAND_JOINT_NAMES,
+    RIGHT_SHARPA_WAVE_JOINT_NAMES,
+    RIGHT_WUJI_HAND_JOINT_NAMES,
+    TELEOP_MODES,
+)
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from isaacteleop.retargeting_engine.tensor_types.indices import (
+    BodyJointIndex,
+    HandJointIndex,
+)
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import ByteMultiArray
+from teleop_ros2_interfaces.msg import NamedPoseArray
 from tf2_msgs.msg import TFMessage
 
-
-_MODES = ("controller_teleop", "hand_teleop", "controller_raw", "full_body")
 _EXPECTED_TF_FRAMES = {"right_wrist", "left_wrist", "head"}
+_EXPECTED_BODY_JOINT_NAMES = [joint.name for joint in BodyJointIndex]
+_HAND_POSE_NAMES = [
+    HandJointIndex(i).name
+    for i in range(HandJointIndex.WRIST, HandJointIndex.LITTLE_TIP + 1)
+]
+_EXPECTED_HAND_POSE_NAMES = [
+    f"{side}_{name}" for side in ("left", "right") for name in _HAND_POSE_NAMES
+]
 
 
 def _is_finite_sequence(values) -> bool:
@@ -46,13 +66,18 @@ def _unpack_msgpack(msg: ByteMultiArray) -> dict:
     )
 
 
-def _assert_pose_array(msg: PoseArray, *, expected_count: int) -> None:
+def _assert_named_pose_array(msg: NamedPoseArray, expected_names: list[str]) -> None:
     if msg.header.frame_id != "world":
         raise ValueError(f"unexpected frame_id {msg.header.frame_id!r}")
-    if len(msg.poses) != expected_count:
-        raise ValueError(f"expected {expected_count} poses, got {len(msg.poses)}")
-    positions = []
-    for pose in msg.poses:
+    names = list(msg.name)
+    if names != expected_names:
+        raise ValueError("named pose entries do not match the expected order")
+    if len(set(names)) != len(names):
+        raise ValueError("named pose entries are not unique")
+    if len(msg.pose) != len(names) or len(msg.is_valid) != len(names):
+        raise ValueError("named pose arrays differ in length")
+
+    for pose in msg.pose:
         position = (pose.position.x, pose.position.y, pose.position.z)
         orientation = (
             pose.orientation.x,
@@ -61,12 +86,78 @@ def _assert_pose_array(msg: PoseArray, *, expected_count: int) -> None:
             pose.orientation.w,
         )
         if not _is_finite_sequence(position):
-            raise ValueError("pose position contains non-finite values")
+            raise ValueError("named pose position contains non-finite values")
         if not _is_finite_sequence(orientation):
-            raise ValueError("pose orientation contains non-finite values")
-        positions.extend(position)
-    if not any(abs(value) > 1e-6 for value in positions):
-        raise ValueError("pose array positions are all zero")
+            raise ValueError("named pose orientation contains non-finite values")
+
+
+def _assert_nonzero_pose_positions(msg: NamedPoseArray, label: str) -> None:
+    if not any(
+        abs(value) > 1e-6
+        for pose in msg.pose
+        for value in (pose.position.x, pose.position.y, pose.position.z)
+    ):
+        raise ValueError(f"{label} positions are all zero")
+
+
+def _assert_noncollinear_positions(
+    positions: list[tuple[float, float, float]], label: str
+) -> None:
+    if len(positions) < 3:
+        raise ValueError(f"{label} needs at least three valid positions")
+
+    anchor = positions[0]
+    vectors = [
+        (
+            position[0] - anchor[0],
+            position[1] - anchor[1],
+            position[2] - anchor[2],
+        )
+        for position in positions[1:]
+    ]
+    for index, left in enumerate(vectors):
+        left_norm_sq = sum(value * value for value in left)
+        for right in vectors[index + 1 :]:
+            right_norm_sq = sum(value * value for value in right)
+            norm_product = left_norm_sq * right_norm_sq
+            if norm_product <= 1e-12:
+                continue
+            cross = (
+                left[1] * right[2] - left[2] * right[1],
+                left[2] * right[0] - left[0] * right[2],
+                left[0] * right[1] - left[1] * right[0],
+            )
+            cross_norm_sq = sum(value * value for value in cross)
+            if cross_norm_sq > norm_product * 1e-8:
+                return
+
+    raise ValueError(f"{label} positions are collinear")
+
+
+def _assert_ee_poses_array(msg: NamedPoseArray) -> None:
+    _assert_named_pose_array(msg, ["left", "right"])
+    if not all(bool(is_valid) for is_valid in msg.is_valid):
+        raise ValueError("EE pose array contains an invalid entry")
+    _assert_nonzero_pose_positions(msg, "EE pose")
+
+
+def _assert_hand_pose_array(msg: NamedPoseArray) -> None:
+    _assert_named_pose_array(msg, _EXPECTED_HAND_POSE_NAMES)
+    if not any(bool(is_valid) for is_valid in msg.is_valid):
+        raise ValueError("all hand joint poses are invalid")
+    _assert_nonzero_pose_positions(msg, "hand joint pose")
+    poses_per_hand = len(_HAND_POSE_NAMES)
+    for side_index, side in enumerate(("left", "right")):
+        start = side_index * poses_per_hand
+        stop = start + poses_per_hand
+        positions = [
+            (pose.position.x, pose.position.y, pose.position.z)
+            for pose, is_valid in zip(
+                msg.pose[start:stop], msg.is_valid[start:stop], strict=True
+            )
+            if bool(is_valid)
+        ]
+        _assert_noncollinear_positions(positions, f"{side} hand joint")
 
 
 def _assert_pose_stamped(
@@ -89,15 +180,27 @@ def _assert_pose_stamped(
         raise ValueError("PoseStamped position is all zero")
 
 
-def _assert_joint_state(msg: JointState) -> None:
+def _assert_joint_state(
+    msg: JointState,
+    *,
+    expected_names: list[str] | None = None,
+    require_nonzero: bool = False,
+) -> None:
     if msg.header.frame_id != "world":
         raise ValueError(f"unexpected frame_id {msg.header.frame_id!r}")
-    if not msg.name:
+    names = list(msg.name)
+    if not names:
         raise ValueError("JointState names are empty")
-    if len(msg.position) != len(msg.name):
+    if len(set(names)) != len(names):
+        raise ValueError("JointState names are not unique")
+    if expected_names is not None and names != expected_names:
+        raise ValueError("JointState names do not match the expected order")
+    if len(msg.position) != len(names):
         raise ValueError("JointState names and positions differ in length")
     if not _is_finite_sequence(msg.position):
         raise ValueError("JointState positions contain non-finite values")
+    if require_nonzero and not any(abs(float(value)) > 1e-6 for value in msg.position):
+        raise ValueError("JointState positions are all zero")
 
 
 def _assert_twist(msg: TwistStamped) -> None:
@@ -147,8 +250,8 @@ def _assert_controller_payload(msg: ByteMultiArray) -> None:
 
 def _assert_full_body_payload(msg: ByteMultiArray) -> None:
     payload = _unpack_msgpack(msg)
-    if len(payload["joint_names"]) != 24:
-        raise ValueError("expected 24 full-body joint names")
+    if payload["joint_names"] != _EXPECTED_BODY_JOINT_NAMES:
+        raise ValueError("full-body joint names do not match the expected order")
     if len(payload["joint_positions"]) != 24:
         raise ValueError("expected 24 full-body joint positions")
     if len(payload["joint_orientations"]) != 24:
@@ -167,18 +270,59 @@ def _assert_full_body_payload(msg: ByteMultiArray) -> None:
             raise ValueError("full-body joint orientation must have 4 values")
         if not _is_finite_sequence(values):
             raise ValueError("full-body joint orientation contains non-finite values")
+    valid_positions = [
+        tuple(float(value) for value in position)
+        for position, is_valid in zip(
+            payload["joint_positions"], payload["joint_valid"], strict=True
+        )
+        if bool(is_valid)
+    ]
+    _assert_noncollinear_positions(valid_positions, "full-body joint")
+
+
+def _finger_joint_validator(hand_retargeter: str) -> Callable:
+    if hand_retargeter == "pink_ik":
+        expected_names = LEFT_SHARPA_WAVE_JOINT_NAMES + RIGHT_SHARPA_WAVE_JOINT_NAMES
+        samples: list[list[float]] = []
+
+        def _validate_pink_ik(msg: JointState) -> None:
+            _assert_joint_state(
+                msg,
+                expected_names=expected_names,
+                require_nonzero=True,
+            )
+            samples.append([float(value) for value in msg.position])
+            if len(samples) < 3:
+                raise ValueError("waiting for three pink_ik joint samples")
+            if not any(
+                abs(value - initial) > 1e-4
+                for sample in samples[1:]
+                for value, initial in zip(sample, samples[0], strict=True)
+            ):
+                raise ValueError("pink_ik finger angles did not change over time")
+
+        return _validate_pink_ik
+    if hand_retargeter == "wuji":
+        return partial(
+            _assert_joint_state,
+            expected_names=(LEFT_WUJI_HAND_JOINT_NAMES + RIGHT_WUJI_HAND_JOINT_NAMES),
+            require_nonzero=True,
+        )
+    return _assert_joint_state
 
 
 class TopicVerifier(Node):
     """Small ROS 2 node that waits for mode-specific verified messages."""
 
-    def __init__(self, mode: str) -> None:
+    def __init__(self, mode: str, hand_retargeter: str) -> None:
         super().__init__("teleop_ros2_topic_verifier")
         self._pending: set[str] = set()
         self._errors: dict[str, str] = {}
         self._seen_tf_frames: set[str] = set()
 
-        for name, topic, msg_type, validator in self._expected_subscriptions(mode):
+        for name, topic, msg_type, validator in self._expected_subscriptions(
+            mode, hand_retargeter
+        ):
             self._pending.add(name)
             self.create_subscription(
                 msg_type, topic, self._make_callback(name, validator), 10
@@ -224,25 +368,15 @@ class TopicVerifier(Node):
         self._pending.discard("tf")
 
     def _expected_subscriptions(
-        self, mode: str
+        self, mode: str, hand_retargeter: str
     ) -> list[tuple[str, str, type, Callable]]:
         if mode == "controller_teleop":
-            return [
+            subscriptions = [
                 (
-                    "ee_pose_left",
-                    "xr_teleop/ee_pose_left",
-                    PoseStamped,
-                    lambda msg: _assert_pose_stamped(
-                        msg, require_nonzero_position=True
-                    ),
-                ),
-                (
-                    "ee_pose_right",
-                    "xr_teleop/ee_pose_right",
-                    PoseStamped,
-                    lambda msg: _assert_pose_stamped(
-                        msg, require_nonzero_position=True
-                    ),
+                    "ee_poses",
+                    "xr_teleop/ee_poses",
+                    NamedPoseArray,
+                    _assert_ee_poses_array,
                 ),
                 ("root_twist", "xr_teleop/root_twist", TwistStamped, _assert_twist),
                 ("root_pose", "xr_teleop/root_pose", PoseStamped, _assert_pose_stamped),
@@ -251,7 +385,7 @@ class TopicVerifier(Node):
                     "finger_joints",
                     "xr_teleop/finger_joints",
                     JointState,
-                    _assert_joint_state,
+                    _finger_joint_validator(hand_retargeter),
                 ),
                 (
                     "controller_data",
@@ -260,29 +394,30 @@ class TopicVerifier(Node):
                     _assert_controller_payload,
                 ),
             ]
+            if hand_retargeter in ("dexpilot", "pink_ik", "wuji"):
+                subscriptions.insert(
+                    0,
+                    (
+                        "hand",
+                        "xr_teleop/hand",
+                        NamedPoseArray,
+                        _assert_hand_pose_array,
+                    ),
+                )
+            return subscriptions
         if mode == "hand_teleop":
             return [
                 (
                     "hand",
                     "xr_teleop/hand",
-                    PoseArray,
-                    lambda msg: _assert_pose_array(msg, expected_count=50),
+                    NamedPoseArray,
+                    _assert_hand_pose_array,
                 ),
                 (
-                    "ee_pose_left",
-                    "xr_teleop/ee_pose_left",
-                    PoseStamped,
-                    lambda msg: _assert_pose_stamped(
-                        msg, require_nonzero_position=True
-                    ),
-                ),
-                (
-                    "ee_pose_right",
-                    "xr_teleop/ee_pose_right",
-                    PoseStamped,
-                    lambda msg: _assert_pose_stamped(
-                        msg, require_nonzero_position=True
-                    ),
+                    "ee_poses",
+                    "xr_teleop/ee_poses",
+                    NamedPoseArray,
+                    _assert_ee_poses_array,
                 ),
                 ("root_twist", "xr_teleop/root_twist", TwistStamped, _assert_twist),
                 ("root_pose", "xr_teleop/root_pose", PoseStamped, _assert_pose_stamped),
@@ -291,7 +426,7 @@ class TopicVerifier(Node):
                     "finger_joints",
                     "xr_teleop/finger_joints",
                     JointState,
-                    _assert_joint_state,
+                    _finger_joint_validator(hand_retargeter),
                 ),
             ]
         if mode == "controller_raw":
@@ -323,7 +458,12 @@ class TopicVerifier(Node):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=_MODES, required=True)
+    parser.add_argument("--mode", choices=TELEOP_MODES, required=True)
+    parser.add_argument(
+        "--hand-retargeter",
+        choices=HAND_RETARGETERS,
+        default="mode_default",
+    )
     parser.add_argument("--timeout", type=float, default=20.0)
     return parser.parse_args()
 
@@ -331,7 +471,7 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     rclpy.init()
-    verifier = TopicVerifier(args.mode)
+    verifier = TopicVerifier(args.mode, args.hand_retargeter)
     try:
         deadline = time.monotonic() + args.timeout
         while verifier.pending and time.monotonic() < deadline:
@@ -346,7 +486,10 @@ def main() -> int:
                 print(f"  {name}: {error}", file=sys.stderr)
             return 1
 
-        print(f"Verified teleop_ros2 topics for mode {args.mode}")
+        print(
+            "Verified teleop_ros2 topics for "
+            f"mode {args.mode} and hand retargeter {args.hand_retargeter}"
+        )
         return 0
     finally:
         verifier.destroy_node()

@@ -12,9 +12,9 @@ examples more readable by focusing on **what** you want to do rather than
 Overview
 --------
 
-The main component is :code-file:`TeleopSession <src/core/teleop_session_manager/python/teleop_session.py>`, which manages the complete lifecycle
+The main component is :code-file:`TeleopSession <src/python/isaacteleop/teleop_session_manager/teleop_session.py>`, which manages the complete lifecycle
 of a teleop session. It wraps the lower-level
-:code-file:`DeviceIOSession <src/core/deviceio/cpp/inc/deviceio/deviceio_session.hpp>`
+:code-file:`DeviceIOSession <src/core/deviceio_session/cpp/inc/deviceio_session/deviceio_session.hpp>`
 and :doc:`device trackers <../device/trackers>` so that callers don't need to
 manage them directly:
 
@@ -36,14 +36,28 @@ Here's a minimal example:
        TeleopSessionConfig,
    )
    from isaacteleop.retargeting_engine.deviceio_source_nodes import ControllersSource
-   from isaacteleop.retargeting_engine.examples import GripperRetargeter
+   from isaacteleop.retargeting_engine.interface import OutputCombiner
+   from isaacteleop.retargeters import GripperRetargeter, GripperRetargeterConfig
 
-   # Create source and build pipeline
+   # Create source and build pipeline (one GripperRetargeter per side)
    controllers = ControllersSource(name="controllers")
-   gripper = GripperRetargeter(name="gripper")
-   pipeline = gripper.connect({
-       "controller_left": controllers.output("controller_left"),
-       "controller_right": controllers.output("controller_right")
+   gripper_left = GripperRetargeter(
+       GripperRetargeterConfig(hand_side="left"),
+       name="gripper_left",
+   )
+   connected_left = gripper_left.connect({
+       ControllersSource.LEFT: controllers.output(ControllersSource.LEFT),
+   })
+   gripper_right = GripperRetargeter(
+       GripperRetargeterConfig(hand_side="right"),
+       name="gripper_right",
+   )
+   connected_right = gripper_right.connect({
+       ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT),
+   })
+   pipeline = OutputCombiner({
+       "gripper_left": connected_left.output("gripper_command"),
+       "gripper_right": connected_right.output("gripper_command"),
    })
 
    # Configure session
@@ -104,7 +118,7 @@ argument is a ``uint64`` handle value.
 
 .. code-block:: python
 
-   from teleopcore.oxr import OpenXRSessionHandles
+   from isaacteleop.oxr import OpenXRSessionHandles
 
    handles = OpenXRSessionHandles(
        instance_handle, session_handle, space_handle, proc_addr
@@ -113,6 +127,30 @@ argument is a ``uint64`` handle value.
        app_name="MyApp",
        pipeline=pipeline,
        oxr_handles=handles,  # Skip internal OpenXR session creation
+   )
+
+Tracker vendor selection
+""""""""""""""""""""""""
+
+In live mode, a vendored source selects the backend ("vendor") for its tracker
+-- for example which backend drives a ``FullBodySource``. The selection is
+carried **on the source** via its ``vendor`` argument, a
+``deviceio.TrackerVendor(id, params)``; sources left at the default use their
+tracker's default vendor. Because the vendor travels with the source, it is part
+of the pipeline: ``TeleopSession`` picks it up automatically, and
+``get_required_oxr_extensions_from_pipeline(pipeline)`` reports the matching
+OpenXR extensions with no extra argument (important for the external-``oxr_handles``
+flow). See :ref:`vendor-selection` for the underlying DeviceIO mechanism and the
+available vendor ids.
+
+.. code-block:: python
+
+   import isaacteleop.deviceio as deviceio
+   from isaacteleop.retargeting_engine.deviceio_source_nodes import FullBodySource
+
+   # Select the backend on the source; it flows through the pipeline into the session.
+   full_body = FullBodySource(
+       name="full_body", vendor=deviceio.TrackerVendor("body.pico-xr")
    )
 
 Retargeting execution
@@ -304,7 +342,14 @@ Configure plugins:
        search_paths=[Path("/path/to/plugins")],
        enabled=True,
        plugin_args=["--arg1=val1", "--arg2=val2"],
+       required=True,
    )
+
+Plugins are optional by default: if none of their search paths exist or the
+configured plugin is not discovered, session startup continues without them.
+Set ``required=True`` to make either condition fail session startup with a
+``RuntimeError``. Setting ``enabled=False`` always disables the plugin,
+regardless of ``required``.
 
 .. note::
 
@@ -382,7 +427,12 @@ The module also exports two utility functions:
 - ``get_required_oxr_extensions_from_pipeline(pipeline) -> List[str]`` --
   Discover the OpenXR extensions needed by a retargeting pipeline by
   traversing its DeviceIO source leaf nodes. Returns a sorted, deduplicated
-  list of extension name strings.
+  list of extension name strings. Extensions are vendor-dependent, but each
+  source carries its own vendor selection, so the result already reflects them
+  -- when you create the OpenXR session yourself and feed the handles in via
+  ``oxr_handles``, the enabled extensions match the session that gets built
+  with no extra argument. Select a vendor on the source (e.g.
+  ``FullBodySource(name="full_body", vendor=deviceio.TrackerVendor("body.pico-xr"))``).
 
 - ``create_standard_inputs(trackers) -> Dict[str, IDeviceIOSource]`` --
   Convenience function that creates ``HandsSource``, ``ControllersSource``,
@@ -426,8 +476,24 @@ Before vs After
 
    # Setup pipeline
    controllers = ControllersSource(name="controllers")
-   gripper = GripperRetargeter(name="gripper")
-   pipeline = gripper.connect({...})
+   gripper_left = GripperRetargeter(
+       GripperRetargeterConfig(hand_side="left"),
+       name="gripper_left",
+   )
+   connected_left = gripper_left.connect({
+       ControllersSource.LEFT: controllers.output(ControllersSource.LEFT),
+   })
+   gripper_right = GripperRetargeter(
+       GripperRetargeterConfig(hand_side="right"),
+       name="gripper_right",
+   )
+   connected_right = gripper_right.connect({
+       ControllersSource.RIGHT: controllers.output(ControllersSource.RIGHT),
+   })
+   pipeline = OutputCombiner({
+       "gripper_left": connected_left.output("gripper_command"),
+       "gripper_right": connected_right.output("gripper_command"),
+   })
 
    # Main loop
    while True:

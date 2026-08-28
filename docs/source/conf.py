@@ -5,7 +5,10 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
 import os
+import sys
 from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ext"))
 
 # -- Project information -----------------------------------------------------
 
@@ -15,14 +18,45 @@ copyright = f"2025-{build_time.year}, NVIDIA CORPORATION & AFFILIATES"
 copyright += f", last updated on {build_time.strftime('%B %d, %Y')}"
 author = "NVIDIA"
 
+
+def _smv_ref_name():
+    """Git ref name sphinx-multiversion is building, or "" outside it.
+
+    sphinx-multiversion builds every ref with ``-c`` pointing at the checkout it
+    was invoked from, so this conf.py is always the deploy branch's and anything
+    read from the tree describes that branch, not the ref. It passes the ref name
+    as ``-D smv_current_version=``, which Sphinx applies to the config only after
+    conf.py has run, so read it off the command line.
+    """
+    prefix = "smv_current_version="
+    return next((a[len(prefix) :] for a in sys.argv if a.startswith(prefix)), "")
+
+
 _version_file = os.path.join(os.path.dirname(__file__), "..", "..", "VERSION")
+# ``VERSION`` is ``MAJOR.MINOR.x`` on main and on every release branch and tag, so its
+# first two components name the release series a given build of the docs describes.
 if os.path.exists(_version_file):
     with open(_version_file) as f:
-        full_version = f.read().strip()
-    version = full_version
-    release = full_version
+        version = release = f.read().strip()
 else:
     version = release = "0.0.0"
+
+
+def _pip_pin(ref_name, fallback):
+    """Install specifier for the series a build describes: ``1.5.x`` -> ``~=1.5.0``.
+
+    Release refs name their own series (``release/1.4.x``, ``v1.4.7``); ``main``
+    and plain ``sphinx-build`` fall back to the checked-out ``VERSION``.
+    """
+    tail = ref_name.rsplit("/", 1)[-1].removeprefix("v")
+    major, _, rest = (tail if tail[:1].isdigit() else fallback).partition(".")
+    minor = rest.partition(".")[0]
+    if not (major.isdigit() and minor.isdigit()) or major == "0":
+        return "~=1.0"
+    return f"~={major}.{minor}.0"
+
+
+_pip_version_pin = _pip_pin(_smv_ref_name(), version)
 
 # -- General configuration -----------------------------------------------------
 
@@ -31,9 +65,16 @@ extensions = [
     "sphinx_copybutton",
     "sphinx_multiversion",
     "sphinx_design",
+    "ecosystem_grid",
 ]
 
-exclude_patterns = ["build", "_templates", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["build", "_templates", "_data", "_ext", "Thumbs.db", ".DS_Store"]
+
+# sphinx-copybutton only targets highlighted blocks (``div.highlight pre``) by default,
+# which skips ``parsed-literal`` (rendered as a bare ``pre.literal-block``).  Commands
+# that interpolate a substitution have to use ``parsed-literal``, so widen the selector
+# to keep the copy button on them.
+copybutton_selector = "div.highlight pre, pre.literal-block"
 
 templates_path = ["_templates"]
 
@@ -50,17 +91,17 @@ html_favicon = "_static/favicon.ico"
 html_show_copyright = True
 html_show_sphinx = False
 html_static_path = ["_static"]
-html_css_files = ["css/custom.css"]
+html_css_files = ["css/custom.css", "css/ecosystem.css"]
 
 # Per-version icon link overrides.  Keyed by the git ref name that
-# sphinx-multiversion builds (SPHINX_MULTIVERSION_NAME env var).  Unmatched
-# refs (including plain ``sphinx-build`` without multiversion) use _DEFAULT_ICONS.
-_smv_name = os.environ.get("SPHINX_MULTIVERSION_NAME", "")
+# sphinx-multiversion builds.  Unmatched refs (including plain ``sphinx-build``
+# without multiversion) use _DEFAULT_ICONS.
+_smv_name = _smv_ref_name()
 
 _DEFAULT_ICONS = {
     "teleop_version": "main",
     "teleop_url": "https://github.com/NVIDIA/IsaacTeleop",
-    "cloudxr_version": "6.1",
+    "cloudxr_version": "6.2",
     "cloudxr_url": "https://docs.nvidia.com/cloudxr-sdk",
     "lab_version": "3.0",
     "lab_url": "https://isaac-sim.github.io/IsaacLab",
@@ -85,12 +126,14 @@ _icons = _VERSION_ICON_MAP.get(_smv_name, _DEFAULT_ICONS)
 _client_slug = (_smv_name or "main").replace("/", "-")
 _web_client_url = f"https://nvidia.github.io/IsaacTeleop/client/{_client_slug}/"
 
-# Shared substitution + link targets injected into every page, so the
-# branch-specific web client URL lives in one place.  ``|web_client_url|``
-# expands the bare URL (usable in prose and ``parsed-literal`` blocks); the
+# Shared substitutions + link targets injected into every page, so the
+# branch-specific web client URL and version pin live in one place.
+# ``|web_client_url|`` expands the bare URL and ``|pip_version_pin|`` the
+# version specifier (both usable in prose and ``parsed-literal`` blocks); the
 # named targets back ```...`_`` references in the prose.
 rst_epilog = f"""
 .. |web_client_url| replace:: {_web_client_url}
+.. |pip_version_pin| replace:: {_pip_version_pin}
 .. _`nvidia.github.io/IsaacTeleop/client`: {_web_client_url}
 .. _`Isaac Teleop Web Client`: {_web_client_url}
 """
@@ -120,13 +163,17 @@ html_theme_options = {
             "type": "url",
         },
     ],
-    "navbar_end": ["theme-switcher"],
+    # The nvidia theme defaults navbar_center to its own version switcher, which
+    # needs a switcher JSON; sphinx-multiversion feeds ``versioning.html`` instead.
+    "navbar_center": [],
+    "navbar_end": ["versioning.html", "search-button-field", "theme-switcher"],
+    # Below 960px the theme hides navbar_end, so search survives as this magnifier.
     "navbar_persistent": ["search-button"],
 }
 
-# Primary sidebar (left): icon links row, search, then TOC (like Isaac Lab)
+# Primary sidebar (left): icon links row, then TOC (like Isaac Lab)
 html_sidebars = {
-    "**": ["versioning.html", "icon-links", "search-field", "sidebar-nav-bs"],
+    "**": ["icon-links", "sidebar-nav-bs"],
 }
 
 # Edit page button: link to GitHub so users can suggest edits (PyData theme uses html_context)
@@ -144,7 +191,7 @@ _GH_BRANCH = html_context["github_version"]
 
 def _parse_code_role(text):
     """Parse role text as 'path' or 'label <path>'. Returns (label, path)."""
-    text = text.strip()
+    text = " ".join(text.split())  # collapse newlines from source line wrapping
     if " <" in text and text.endswith(">"):
         label, path = text.rsplit(" <", 1)
         return label.strip(), path[:-1].strip()

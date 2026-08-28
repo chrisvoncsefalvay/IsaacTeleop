@@ -35,26 +35,30 @@
  * back to the parent component through callback props.
  */
 
+import { ReadonlySignal } from '@preact/signals-react';
+import { useFrame } from '@react-three/fiber';
+import { Handle, HandleState, HandleTarget } from '@react-three/handle';
+import { Container, Image, Text } from '@react-three/uikit';
+import { Button } from '@react-three/uikit-default';
+import React, { useEffect, useRef, useState } from 'react';
+import { Color, Group, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three';
+import { damp } from 'three/src/math/MathUtils.js';
+
+import { PerformanceCanvasImage } from '@helpers/react/PerformanceCanvasImage';
+import { useXRButton } from '@helpers/react/useXRButton';
+
 import arrowLeftStartOnRectangleSvg from './icons/arrow-left-start-on-rectangle.svg';
 import arrowUturnLeftSvg from './icons/arrow-uturn-left.svg';
 import playCircleSvg from './icons/play-circle.svg';
-import { PerformanceCanvasImage } from '@helpers/react/PerformanceCanvasImage';
-import { useXRButton } from '@helpers/react/useXRButton';
-import { ReadonlySignal } from '@preact/signals-react';
-import { useFrame } from '@react-three/fiber';
-import { Handle, HandleTarget, HandleState } from '@react-three/handle';
-import { Container, Text, Image } from '@react-three/uikit';
-import { Button } from '@react-three/uikit-default';
-import React, { useRef, useState, useEffect } from 'react';
-import { Color, Group, Mesh, MeshStandardMaterial, Object3D, Vector3 } from 'three';
-import { damp } from 'three/src/math/MathUtils.js';
+import { useRecorder } from './RecorderContext';
 
 // Face-camera rotation constants
 const FACE_CAMERA_DAMPING = 10; // Higher = faster rotation toward camera
 
 /** Display size for the Performance metrics slot (width and height passed to PerformanceCanvasImage and its container). */
 const METRIC_SLOT_WIDTH = 512;
-const METRIC_SLOT_HEIGHT = 250;
+/** Tracks PerformanceCanvasImage's 1024x760 canvas: the session-quality card plus four metric cards. */
+const METRIC_SLOT_HEIGHT = 380;
 
 interface CloudXRUIProps {
   onStartTeleop?: () => void;
@@ -72,14 +76,111 @@ interface CloudXRUIProps {
   rotation?: [number, number, number];
   /** Computed signal for render FPS text - updates without React re-render */
   renderFpsText?: ReadonlySignal<string>;
+  /** Computed signal for pose send FPS text - the rate operator intent reaches the robot */
+  poseSendFpsText?: ReadonlySignal<string>;
   /** Computed signal for streaming FPS text - updates without React re-render */
   streamingFpsText?: ReadonlySignal<string>;
   /** Computed signal for pose-to-render latency text - updates without React re-render */
   poseToRenderText?: ReadonlySignal<string>;
+  /** Live session quality 0-4 ({@link CloudXR.QualityScore}); drives the HUD quality bars. */
+  sessionQuality?: ReadonlySignal<number>;
+  /** Network test status line; empty when no test is running or configured. */
+  streamTestText?: ReadonlySignal<string>;
+  /** Traffic-light color for {@link streamTestText}. */
+  streamTestColor?: ReadonlySignal<string>;
   /** From settings: hide control panel when immersive XR begins. */
   panelHiddenAtStart?: boolean;
   /** Immersive XR active; used to apply panelHiddenAtStart on session enter. */
   isXRMode?: boolean;
+  /** Show input recording controls in the XR panel. */
+  showRecordingControls?: boolean;
+  /** Computed signal for the workstation notice title; empty when no notice is active. */
+  systemNoticeTitleText?: ReadonlySignal<string>;
+  /** Computed signal for the workstation notice body (one unmet requirement per line). */
+  systemNoticeBodyText?: ReadonlySignal<string>;
+  /** Whether a workstation notice is currently active. */
+  systemNoticeVisible?: boolean;
+  /** Severity of the active notice; selects the banner palette. */
+  systemNoticeLevel?: 'warning' | 'info';
+  /** Dismiss the workstation notice. */
+  onDismissSystemNotice?: () => void;
+}
+
+/**
+ * Warning banner shown in-headset when the host reports that its workstation is
+ * below the recommended teleop spec.
+ *
+ * Advisory only: it never blocks the session, so it is dismissible and also
+ * times out on its own. Text comes in as signals so updates bypass React,
+ * matching how the performance metrics are rendered.
+ */
+/** Palette per notice level, so an informational notice does not read as a warning. */
+const SYSTEM_NOTICE_PALETTE = {
+  warning: {
+    border: 'rgba(255, 193, 7, 0.9)',
+    background: 'rgba(80, 60, 0, 0.85)',
+    title: 'rgba(255, 213, 79, 1)',
+  },
+  info: {
+    border: 'rgba(66, 165, 245, 0.9)',
+    background: 'rgba(10, 45, 80, 0.85)',
+    title: 'rgba(144, 202, 249, 1)',
+  },
+} as const;
+
+function SystemNoticeBanner({
+  titleText,
+  bodyText,
+  level = 'warning',
+  onDismiss,
+}: {
+  titleText?: ReadonlySignal<string>;
+  bodyText?: ReadonlySignal<string>;
+  level?: 'warning' | 'info';
+  onDismiss?: () => void;
+}) {
+  const palette = SYSTEM_NOTICE_PALETTE[level];
+  const xrButton = useXRButton();
+  return (
+    <Container
+      flexDirection="row"
+      gap={16}
+      alignItems="center"
+      justifyContent="space-between"
+      padding={16}
+      marginBottom={8}
+      borderRadius={12}
+      borderWidth={2}
+      borderColor={palette.border}
+      backgroundColor={palette.background}
+    >
+      <Container flexDirection="column" gap={6} flexGrow={1}>
+        <Text fontSize={34} fontWeight="bold" color={palette.title}>
+          {titleText}
+        </Text>
+        {/* whiteSpace="pre-line" is required, not cosmetic: uikit's default
+            normalization collapses every run of whitespace -- newlines
+            included -- into a single space, which would run the summary, each
+            unmet requirement, and its fix together on one unreadable line. */}
+        <Text fontSize={28} color="rgba(240, 240, 240, 1)" whiteSpace="pre-line">
+          {bodyText}
+        </Text>
+      </Container>
+      <Button
+        {...xrButton('system-notice-dismiss', onDismiss ?? (() => {}))}
+        variant="default"
+        width={80}
+        height={64}
+        borderRadius={16}
+        backgroundColor="rgba(220, 220, 220, 0.9)"
+        hover={{ backgroundColor: 'rgba(100, 150, 255, 1)', borderColor: 'white', borderWidth: 2 }}
+      >
+        <Text fontSize={32} color="black" fontWeight="bold">
+          X
+        </Text>
+      </Button>
+    </Container>
+  );
 }
 
 // Reusable objects for face-camera rotation (avoid allocations in render loop)
@@ -102,6 +203,38 @@ function applyPositionSkipRotation(state: HandleState<unknown>, target: Object3D
   target.position.copy(state.current.position);
 }
 
+function RecordingButton({
+  id,
+  label,
+  onClick,
+  disabled = false,
+  active = false,
+}: {
+  id: string;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+}) {
+  const xrButton = useXRButton();
+  return (
+    <Button
+      {...xrButton(id, onClick)}
+      variant="default"
+      width={140}
+      height={72}
+      borderRadius={20}
+      disabled={disabled}
+      backgroundColor={active ? 'rgba(220, 60, 60, 0.9)' : 'rgba(220, 220, 220, 0.9)'}
+      hover={{ backgroundColor: 'rgba(100, 150, 255, 1)', borderColor: 'white', borderWidth: 2 }}
+    >
+      <Text fontSize={30} color="black" fontWeight="medium">
+        {label}
+      </Text>
+    </Button>
+  );
+}
+
 export default function CloudXR3DUI({
   onStartTeleop,
   onDisconnect,
@@ -117,11 +250,22 @@ export default function CloudXR3DUI({
   position = [1.8, 1.75, -1.3],
   rotation = [0, 0, 0], // Note: Y rotation is controlled by face-camera logic
   renderFpsText,
+  poseSendFpsText,
   streamingFpsText,
   poseToRenderText,
+  sessionQuality,
+  streamTestText,
+  streamTestColor,
   panelHiddenAtStart = false,
   isXRMode = false,
+  showRecordingControls = false,
+  systemNoticeTitleText,
+  systemNoticeBodyText,
+  systemNoticeVisible = false,
+  systemNoticeLevel = 'warning',
+  onDismissSystemNotice,
 }: CloudXRUIProps) {
+  const recorder = useRecorder();
   const MINIMIZE_ON_PLAY_KEY = 'cxr.isaac.minimizeOnPlay';
 
   const groupRef = useRef<Group>(null);
@@ -165,6 +309,13 @@ export default function CloudXR3DUI({
   const isMinimizedLayout = isCompact || panelHidden;
   const handleWidth = panelHidden ? 0.12 : isCompact ? 0.28 : 1.0;
   const handleY = panelHidden ? -0.065 : isCompact ? -0.15 : -0.42;
+  // The notice only floats when the panel is collapsed; the full panel renders
+  // it inline. Clearing the top edge of a 2.33-unit-tall panel would put the
+  // notice about a metre above the operator's head, out of view entirely --
+  // floating is what keeps it visible when the panel is small, not a layout
+  // that makes sense at full size.
+  const noticeFloats = panelHidden || isCompact;
+  const noticeY = panelHidden ? 0.42 : 0.6;
 
   // Face-camera rotation: smoothly rotate UI to face the user (Y-axis only)
   useFrame((state, dt) => {
@@ -398,8 +549,10 @@ export default function CloudXR3DUI({
                       width={METRIC_SLOT_WIDTH}
                       height={METRIC_SLOT_HEIGHT}
                       renderFpsText={renderFpsText}
+                      poseSendFpsText={poseSendFpsText}
                       streamingFpsText={streamingFpsText}
                       poseToRenderText={poseToRenderText}
+                      sessionQuality={sessionQuality}
                     />
                   </Container>
                 </Container>
@@ -438,6 +591,56 @@ export default function CloudXR3DUI({
                   </Text>
                 </Container>
 
+                {showRecordingControls && (
+                  <Container
+                    width="100%"
+                    flexDirection="column"
+                    gap={12}
+                    alignItems="center"
+                    marginTop={16}
+                  >
+                    <Text fontSize={36} fontWeight="bold" color="rgba(220, 220, 220, 1)">
+                      {recorder.mode === 'recording'
+                        ? `REC ${recorder.recordedFrameCount} frames`
+                        : recorder.mode === 'replaying'
+                          ? 'Replaying'
+                          : 'Recording'}
+                    </Text>
+                    <Container flexDirection="row" gap={12} justifyContent="center">
+                      {recorder.mode !== 'replaying' && (
+                        <RecordingButton
+                          id="record-input"
+                          label={recorder.mode === 'recording' ? 'Stop' : 'Rec'}
+                          onClick={
+                            recorder.mode === 'recording'
+                              ? recorder.stopRecord
+                              : recorder.startRecord
+                          }
+                          active={recorder.mode === 'recording'}
+                        />
+                      )}
+                      {recorder.mode !== 'recording' && (
+                        <RecordingButton
+                          id="replay-input"
+                          label={recorder.mode === 'replaying' ? 'Stop' : 'Play'}
+                          onClick={
+                            recorder.mode === 'replaying'
+                              ? recorder.stopReplay
+                              : recorder.startReplay
+                          }
+                          disabled={recorder.mode === 'idle' && !recorder.savedRecording}
+                        />
+                      )}
+                      {recorder.mode === 'idle' && recorder.savedRecording && (
+                        <RecordingButton
+                          id="save-input"
+                          label="Save"
+                          onClick={recorder.onSaveRecording}
+                        />
+                      )}
+                    </Container>
+                  </Container>
+                )}
               </Container>
 
               {/* Right Column - Controls */}
@@ -453,6 +656,17 @@ export default function CloudXR3DUI({
                   Controls
                 </Text>
 
+                {/* Workstation advisory, inline while the panel is full size.
+                    See the floating copy below for the collapsed states. */}
+                {systemNoticeVisible && !noticeFloats && (
+                  <SystemNoticeBanner
+                    titleText={systemNoticeTitleText}
+                    bodyText={systemNoticeBodyText}
+                    level={systemNoticeLevel}
+                    onDismiss={onDismissSystemNotice}
+                  />
+                )}
+
                 {/* Server Info */}
                 <Container
                   flexDirection="column"
@@ -466,6 +680,11 @@ export default function CloudXR3DUI({
                   </Text>
                   <Text fontSize={38} color="rgba(200, 200, 200, 1)" textAlign="center">
                     Status: {sessionStatus}
+                  </Text>
+                  {/* Network test status. Signals drive the text and traffic-light color;
+                      both are empty when the test is off, which is the default. */}
+                  <Text fontSize={34} color={streamTestColor} textAlign="center">
+                    {streamTestText}
                   </Text>
                 </Container>
 
@@ -627,6 +846,40 @@ export default function CloudXR3DUI({
             </Container>
           )}
         </Container>
+
+        {/* Workstation advisory from the host, in its floating form.
+            The panel collapses to compact when "minimize on play" fires, and to
+            a bare Show button when hidden -- either would swallow the warning at
+            exactly the moment the operator is working. Rendering it as a sibling
+            of the panel keeps it visible in those states, while it still rides
+            the panel's drag position and face-camera rotation so it appears
+            where the operator already put their UI.
+
+            The full panel renders the notice inline instead: it is 2.33 units
+            tall, so a floating notice clearing its top edge would sit about a
+            metre above the operator's head. */}
+        {systemNoticeVisible && noticeFloats && (
+          <group position={[0, noticeY, 0]}>
+            <Container
+              pixelSize={0.001}
+              width={1400}
+              height={340}
+              alignItems="center"
+              justifyContent="center"
+              pointerEvents="auto"
+              sizeX={2.33}
+              sizeY={0.57}
+              flexDirection="column"
+            >
+              <SystemNoticeBanner
+                titleText={systemNoticeTitleText}
+                bodyText={systemNoticeBodyText}
+                level={systemNoticeLevel}
+                onDismiss={onDismissSystemNotice}
+              />
+            </Container>
+          </group>
+        )}
       </group>
     </HandleTarget>
   );

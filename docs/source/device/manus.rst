@@ -7,7 +7,9 @@ MANUS Gloves
 A Linux-only plugin for integrating `MANUS <https://www.manus-meta.com/>`_ gloves
 into the Isaac Teleop framework. It provides full hand-joint tracking via the
 Manus SDK and injects the resulting poses into the OpenXR hand-tracking layer so
-any downstream retargeter can consume them transparently.
+any downstream retargeter can consume them transparently. Optionally it also
+publishes Manus flex-sensor (RawDeviceData) tip poses as ``JointStateOutput``
+tensors and consumes inbound haptic commands for vibration gloves.
 
 .. contents:: On this page
    :local:
@@ -66,6 +68,9 @@ Run this **inside the build environment** (devcontainer or Isaac ROS container):
    cd src/plugins/manus
    ./install_manus.sh
 
+Pass ``--build-dir <path>`` to reuse a non-default top-level CMake build
+directory.
+
 The script will:
 
 1. Install the required system packages for MANUS Core Integrated.
@@ -74,7 +79,9 @@ The script will:
 4. Build the plugin and the diagnostic tool.
 
 When run inside a container, ``install_manus.sh`` skips the udev step and
-reminds you to run ``install_udev_rules.sh`` on the host.
+reminds you to run ``install_udev_rules.sh`` on the host. Pass ``--container``
+when the build environment does not expose standard container markers, such as
+during a Docker BuildKit build.
 
 Manual installation
 ~~~~~~~~~~~~~~~~~~~
@@ -126,23 +133,23 @@ The MANUS plugin connects to the Teleop session through the CloudXR / OpenXR
 runtime, so the runtime must be running and its environment sourced in the
 shell that launches the plugin.
 
-In one terminal, start the CloudXR runtime (keep it running for the duration
-of the session):
+Start the CloudXR runtime. It runs as a background service that outlives
+this shell, until you stop it with ``python -m isaacteleop.cloudxr.service stop``:
 
 .. code-block:: bash
 
-   python -m isaacteleop.cloudxr
+   python -m isaacteleop.cloudxr.service start
 
-In the terminal you will use to run the plugin, source the environment file
+In the shell you will use to run the plugin, source the environment file
 that the runtime writes on startup. This points the OpenXR loader at CloudXR:
 
 .. code-block:: bash
 
    source ~/.cloudxr/run/cloudxr.env
 
-See :ref:`run-cloudxr-server` and :ref:`load-cloudxr-environment-variables`
-in the Quick Start for the full CloudXR runtime setup, including EULA
-acceptance and firewall configuration.
+See :ref:`dedicated-cloudxr-runtime` for the full CloudXR service setup,
+including EULA acceptance, and :ref:`whitelist-firewall-ports` in the Quick
+Start for firewall configuration.
 
 2. Verify with the CLI tool
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -166,6 +173,66 @@ SDK connection at a time.
 .. code-block:: bash
 
    ./install/plugins/manus/manus_hand_plugin
+
+By default the plugin enables human hand injection, flex-sensor push, and
+haptic read. Restrict datasets with ``--datasets=`` (comma-separated):
+
+.. code-block:: bash
+
+   ./install/plugins/manus/manus_hand_plugin --datasets=human,sensors,haptic
+   ./install/plugins/manus/manus_hand_plugin --datasets=human          # skeleton only
+   ./install/plugins/manus/manus_hand_plugin --datasets=sensors        # flex sensors only
+
+Data paths
+----------
+
+Human (OpenXR hand injection)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Manus raw skeleton stream is mapped to 26 OpenXR hand joints and pushed
+through ``HandInjector`` (requires ``XR_NVX1_device_interface_base``). Downstream
+hosts consume hands via ``HandsSource`` as with any other hand-tracking plugin.
+
+Sensors (flex tips via SchemaPusher)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When gloves report at least five RawDeviceData flex sensors, the plugin pushes
+a ``JointStateOutput`` (tensor id ``joint_state``) on:
+
+- ``manus_sensors_left``
+- ``manus_sensors_right``
+
+Layout: 35 joints named ``j0``..``j34``. For sensor ``i`` in thumb→pinky order,
+``j[7*i : 7*i+7]`` is ``[x, y, z, qx, qy, qz, qw]`` (meters, quaternion xyzw)
+in the Manus SDK frame after the plugin's VUH coordinate setup. Poses are raw
+Manus flex transforms; hosts that mask against a re-framed skeleton must apply
+their own sensor-pose processing.
+
+This path requires CloudXR tensor **push** extensions
+(``XR_NVX1_push_tensor`` and ``XR_NVX1_tensor_data``). When sensors first become
+available the plugin logs ``sensors=on`` once per side.
+
+Host-side consumption example:
+
+.. code-block:: python
+
+   from isaacteleop.retargeting_engine.deviceio_source_nodes import JointStateSource
+
+   SENSOR_JOINTS = [f"j{i}" for i in range(35)]
+   left = JointStateSource(
+       name="manus_sensors_left",
+       collection_id="manus_sensors_left",
+       joint_names=SENSOR_JOINTS,
+   )
+   # Decode thumb tip: joints j0..j6 -> [x, y, z, qx, qy, qz, qw]
+
+Haptic (inbound vibration)
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The plugin reads ``HapticCommand`` on collection ``manus_glove_haptic``
+(``XR_NVX1_tensor_data``) and drives five finger motors via the Manus SDK.
+See the haptic feedback example and
+``isaacteleop.haptic_devices.glove.haptic_glove_device``.
 
 Wrist Positioning — Controllers vs Optical Hand Tracking
 ---------------------------------------------------------
@@ -207,7 +274,7 @@ Troubleshooting
    * - No data received
      - Ensure MANUS Core is running and the gloves are connected and calibrated.
    * - CloudXR runtime errors
-     - Make sure the CloudXR runtime is running (``python -m isaacteleop.cloudxr``)
+     - Check that a runtime is serving with ``python -m isaacteleop.cloudxr.service status``,
        and that ``~/.cloudxr/run/cloudxr.env`` has been sourced in the same
        terminal as the plugin.
    * - Permission denied for USB devices

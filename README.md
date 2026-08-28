@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 
 **The unified framework for high-fidelity ego-centric and robotics data collection.**
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![Isaac Lab](https://img.shields.io/badge/Isaac%20Lab-3.0.0-orange.svg)](https://isaac-sim.github.io/IsaacLab/develop)
 [![numpy](https://img.shields.io/badge/numpy-1.23%2B-lightgrey.svg)](https://numpy.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
@@ -33,15 +33,13 @@ standardizing high-fidelity human demo data collection; and foster device & data
 - Standardized device interface
 - Flexible retargeting framework
 
-See the [Ecosystem](https://nvidia.github.io/IsaacTeleop/main/overview/ecosystem.html) page for supported robotics stacks, devices, and retargeting details.
-
 ### Teleoperation Use Cases
 
 - Currently supported use cases
   - Use XR headsets for gripper / tri-finger hand manipulation
   - Use XR headsets with gloves for dex-hand manipulation
   - Seated full body loco-manipulation (Homie)
-  - Tracking based full body loco-manipulation (Sonic)
+  - Tracking based full body loco-manipulation with GR00T-WholeBodyControl (SONIC)
   - Egocentric data collection (aka “no-robot”)
 - Upcoming use cases
   - Teleoperate using only non-XR devices (e.g. gamepad, Gello, haply, etc.)

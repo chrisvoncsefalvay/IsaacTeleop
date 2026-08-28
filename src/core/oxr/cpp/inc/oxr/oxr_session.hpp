@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -18,7 +18,7 @@ namespace core
 class OpenXRSession
 {
 public:
-    OpenXRSession(const std::string& app_name, const std::vector<std::string>& extensions, bool wait_for_system = false);
+    OpenXRSession(const std::string& app_name, const std::vector<std::string>& extensions, bool wait_for_system = true);
 
     // Get session handles for use with trackers
     OpenXRSessionHandles get_handles() const;
