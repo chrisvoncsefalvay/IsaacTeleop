@@ -46,10 +46,38 @@ import numpy as np
 from pipeline import Frame, FrameSource, SourceSpec
 
 
-def notify(tag: str, msg: str) -> None:
-    # Stderr-direct so it shows without a configured Python logger.
-    # Reserved for lifecycle events; periodic stats use notify_verbose.
-    print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+_SINK = None
+
+
+def set_notify_sink(sink) -> None:
+    """Send notifications somewhere other than stderr.
+
+    The status panel redraws stderr in place, so it hands its own writer in
+    here: a lifecycle message printed underneath it would land mid-panel and
+    leave every later repaint misaligned.
+    """
+    global _SINK
+    _SINK = sink
+
+
+def notify(tag: str, msg: str, level: int = logging.INFO) -> None:
+    """Lifecycle events (opening/connected/streaming/errors); see notify_verbose for stats.
+
+    *level* separates the two halves this one function carries: "connected" and
+    "streaming" are INFO, a failed open or a forced reconnect is not.
+    """
+    # The sink still wins when one is installed: the status panel owns stderr
+    # while it is up, and the console handler writes there too, so logging
+    # instead of handing the line over would repaint the panel out of line.
+    if _SINK is not None:
+        _SINK(f"[{tag}] {msg}")
+        return
+    # With logging off camera_viz has no handler, and lastResort drops INFO. Read
+    # directly: camera_streamer.py imports this module and no isaaccapture.
+    if (os.environ.get("ISAACCAPTURE_LOGGING") or "").strip().lower() == "off":
+        print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+        return
+    logger.log(level, "[%s] %s", tag, msg)
 
 
 _VERBOSE = False
@@ -75,10 +103,12 @@ def _verbose_enabled() -> bool:
 def notify_verbose(tag: str, msg: str) -> None:
     """Periodic stats; gated by YAML ``verbose:`` or CAMERA_VIZ_VERBOSE."""
     if _verbose_enabled():
-        print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
+        notify(tag, msg)
 
 
-logger = logging.getLogger(__name__)
+# Named under isaaccapture.* (not plain __name__) so the module actually
+# nests under, and inherits handlers from, the root isaaccapture logger.
+logger = logging.getLogger("isaaccapture.camera_viz.sources")
 
 
 def alloc_pinned_host(shape: tuple, dtype: np.dtype) -> np.ndarray:
@@ -134,8 +164,8 @@ class PolledSource(FrameSource):
             import cupy as cp
         except ImportError as e:
             raise RuntimeError(
-                f"{self._kind} source requires CuPy (cupy-cuda12x). "
-                "Install via `uv pip install cupy-cuda12x`."
+                f"{self._kind} source requires CuPy. Run `camera_viz.sh setup` "
+                "to install the package matching your CUDA toolkit."
             ) from e
 
         self._cp = cp
@@ -295,7 +325,7 @@ class PolledSource(FrameSource):
                 try:
                     self._connected = self._open_device()
                 except Exception as e:
-                    notify(self._kind, f"open failed ({e})")
+                    notify(self._kind, f"open failed ({e})", logging.ERROR)
                     self._connected = False
                 if not self._connected:
                     self._reconnect_count += 1
@@ -307,7 +337,7 @@ class PolledSource(FrameSource):
             try:
                 host = self._grab()
             except Exception as e:
-                notify(self._kind, f"grab failed ({e}); reconnecting")
+                notify(self._kind, f"grab failed ({e}); reconnecting", logging.ERROR)
                 self._mark_disconnected()
                 continue
             if host is None:
@@ -320,7 +350,7 @@ class PolledSource(FrameSource):
                 self._upload_and_convert(buf)
                 self._stream.synchronize()
             except Exception as e:
-                notify(self._kind, f"frame error ({e}); reconnecting")
+                notify(self._kind, f"frame error ({e}); reconnecting", logging.ERROR)
                 self._mark_disconnected()
                 continue
 

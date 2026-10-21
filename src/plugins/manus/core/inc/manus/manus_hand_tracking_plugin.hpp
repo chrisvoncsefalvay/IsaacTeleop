@@ -3,19 +3,25 @@
 
 #pragma once
 
+#include "manus_glove_collection.hpp"
+
 #include <deviceio_session/deviceio_session.hpp>
 #include <deviceio_trackers/controller_tracker.hpp>
 #include <deviceio_trackers/hand_tracker.hpp>
 #include <deviceio_trackers/haptic_command_reader_tracker.hpp>
+#include <log_bridge/logger.hpp>
 #include <openxr/openxr_platform.h>
 #include <oxr/oxr_session.hpp>
 #include <oxr_utils/oxr_time.hpp>
 #include <plugin_utils/hand_injector.hpp>
+#include <plugin_utils/plugin_device_status_publisher.hpp>
+#include <pusherio/schema_pusher.hpp>
 
 #include <ManusSDK.h>
 #include <XR_MNDX_xdev_space.h>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,11 +43,24 @@ namespace manus
 // different actuator count would change this and the values it consumes.
 inline constexpr std::size_t kManusFingerCount = 5;
 
+/// Runtime feature flags for manus_hand_plugin (parsed from --datasets=...).
+struct ManusPluginConfig
+{
+    std::string app_name = "ManusHandPlugin";
+    std::optional<std::string> monitoring_plugin_root_id;
+    std::string left_calibration_file;
+    std::string right_calibration_file;
+    bool human = true; // OpenXR HandInjector
+    bool sensors = true; // RawDeviceData -> SchemaPusher
+    bool haptic = true; // inbound HapticCommandReaderTracker
+};
+
 class __attribute__((visibility("default"))) ManusTracker
 {
 public:
-    /// Get the singleton instance
-    static ManusTracker& instance(const std::string& app_name = "ManusHandPlugin") noexcept(false);
+    /// Get the singleton instance. The first call constructs with ``config``;
+    /// later calls (e.g. from Manus SDK callbacks) ignore ``config``.
+    static ManusTracker& instance(const ManusPluginConfig& config = ManusPluginConfig{}) noexcept(false);
 
     void update();
     std::vector<SkeletonNode> get_left_hand_nodes() const;
@@ -64,22 +83,33 @@ public:
 
 private:
     // Lifecycle
-    explicit ManusTracker(const std::string& app_name) noexcept(false);
+    explicit ManusTracker(const ManusPluginConfig& config) noexcept(false);
     ~ManusTracker();
 
     ManusTracker(const ManusTracker&) = delete;
     ManusTracker& operator=(const ManusTracker&) = delete;
     ManusTracker(ManusTracker&&) = delete;
     ManusTracker& operator=(ManusTracker&&) = delete;
-    void initialize(const std::string& app_name) noexcept(false);
+    void initialize() noexcept(false);
     void shutdown_sdk();
 
     // ManusSDK specific methods
     void RegisterCallbacks();
     void ConnectToGloves() noexcept(false);
     void DisconnectFromGloves();
+    bool apply_glove_calibration(uint32_t glove_id, bool is_left);
     static void OnSkeletonStream(const SkeletonStreamInfo* skeleton_stream_info);
     static void OnLandscapeStream(const Landscape* landscape);
+    static void OnRawDeviceDataStream(const RawDeviceDataInfo* raw_device_data_info);
+    // Registered before CoreSdk_InitializeIntegrated() (see initialize()), so it may fire
+    // synchronously from within that call, on the calling thread, before the ManusTracker
+    // singleton (a function-local static in instance()) has finished constructing. Must
+    // therefore never call instance() -- see the definition for how it gets its logger.
+    static void OnLog(LogSeverity p_Severity, const char* p_Log, uint32_t p_Length) noexcept;
+
+    void push_sensor_states();
+    void push_sensor_side(bool is_left, core::SchemaPusher& pusher);
+    void publish_device_status();
 
     // OpenXR specific methods
     void inject_hand_data();
@@ -94,6 +124,9 @@ private:
 
     // -- Member Variables --
 
+    ManusPluginConfig m_config;
+    std::shared_ptr<spdlog::logger> m_logger = isaaccapture::Logger::get("isaaccapture.plugins.manus.ManusTracker");
+
     // Lifecycle
     std::mutex m_lifecycle_mutex;
     bool m_initialized = false;
@@ -102,6 +135,9 @@ private:
     mutable std::mutex landscape_mutex;
     std::optional<uint32_t> left_glove_id;
     std::optional<uint32_t> right_glove_id;
+    std::vector<unsigned char> m_left_calibration_file;
+    std::vector<unsigned char> m_right_calibration_file;
+    std::array<bool, 2> m_calibration_failed{ { false, false } };
     bool is_connected = false;
 
     // Haptic state — the per-side log-once flags use std::atomic to stay
@@ -109,6 +145,11 @@ private:
     // mid-session). Only `apply_haptic_command` (non-const) writes here, so
     // no `mutable` is needed; const callers do not touch these flags.
     std::array<std::atomic<bool>, 2> m_haptic_error_logged{ { false, false } };
+
+    // Flex-sensor cache (RawDeviceData). Indexed 0=left, 1=right.
+    mutable std::mutex m_sensor_mutex;
+    std::array<uint32_t, 2> m_sensor_count{ { 0, 0 } };
+    std::array<std::array<ManusTransform, kManusSensorCount>, 2> m_sensor_transforms{};
 
     // OpenXR State
     std::shared_ptr<core::OpenXRSession> m_session;
@@ -121,6 +162,10 @@ private:
     // inc/manus/manus_glove_collection.hpp. Read each frame in update().
     std::shared_ptr<core::HapticCommandReaderTracker> m_haptic_reader;
     std::unique_ptr<core::DeviceIOSession> m_deviceio_session;
+    std::unique_ptr<core::SchemaPusher> m_left_sensor_pusher;
+    std::unique_ptr<core::SchemaPusher> m_right_sensor_pusher;
+    std::unique_ptr<plugin_utils::PluginDeviceStatusPublisher> m_status_publisher;
+    bool m_status_publish_error_logged = false;
 
     // XDev native hand trackers (Quest 3 hand tracking via XR_MNDX_xdev_space)
     XrXDevListMNDX m_xdev_list = XR_NULL_HANDLE;
@@ -145,6 +190,7 @@ private:
     mutable std::mutex m_skeleton_mutex;
     std::vector<SkeletonNode> m_left_hand_nodes;
     std::vector<SkeletonNode> m_right_hand_nodes;
+    std::array<std::chrono::steady_clock::time_point, 2> m_skeleton_stamps{};
     // Node topology (parent IDs) — populated once per glove connect
     std::vector<NodeInfo> m_left_node_info;
     std::vector<NodeInfo> m_right_node_info;

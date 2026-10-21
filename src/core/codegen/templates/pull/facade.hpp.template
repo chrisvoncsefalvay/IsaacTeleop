@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+#include <deviceio_base/@BASE_HEADER@.hpp>
+#include <schema/@SCHEMA@_generated.h>
+#if @HAS_METADATA@
+#include <schema/@METADATA_SCHEMA@_generated.h>
+#endif
+
+#include <cstddef>
+#include <string>
+#include <string_view>
+namespace core
+{
+class @CLASS@ : public ITracker
+{
+public:
+    static constexpr size_t DEFAULT_MAX_FLATBUFFER_SIZE = @MAX_FLATBUFFER_SIZE@;
+
+#if @HAS_TENSOR_IDENTIFIER@
+    static constexpr std::string_view TENSOR_IDENTIFIER = "@TENSOR_IDENTIFIER@";
+#endif
+
+    explicit @CLASS@(const std::string& collection_id, size_t max_flatbuffer_size = DEFAULT_MAX_FLATBUFFER_SIZE);
+    std::string_view get_name() const override
+    {
+        return TRACKER_NAME;
+    }
+    const Serialized<@FB_TABLE@>& get_data(const ITrackerSession& session) const;
+#if @HAS_METADATA@
+    //! The first metadata received from the producer: empty until it arrives, then fixed for the session.
+    //! get_data() is empty until the producer's metadata is confirmed. A different one from the
+    //! producer makes the session update throw.
+    const Serialized<@METADATA@>& get_metadata(const ITrackerSession& session) const;
+#endif
+    const std::string& collection_id() const
+    {
+        return collection_id_;
+    }
+    size_t max_flatbuffer_size() const
+    {
+        return max_flatbuffer_size_;
+    }
+
+private:
+    static constexpr const char* TRACKER_NAME = "@CLASS@";
+    std::string collection_id_;
+    size_t max_flatbuffer_size_;
+};
+} // namespace core

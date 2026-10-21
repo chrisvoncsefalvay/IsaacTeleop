@@ -12,10 +12,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <viz/core/vk_context.hpp>
+#include <viz/layers/cylinder_layer.hpp>
+#include <viz/layers/equirect_layer.hpp>
 #include <viz/layers/projection_layer.hpp>
 #include <viz/layers/quad_layer.hpp>
 #include <viz/session/frame_info.hpp>
 #include <viz/session/viz_session.hpp>
+#include <viz/xr/openxr_session.hpp>
 
 #include <cstdint>
 #include <stdexcept>
@@ -36,6 +39,7 @@ void bind_session(py::module_& m)
         .def_readonly("predicted_display_time", &viz::FrameInfo::predicted_display_time)
         .def_readonly("delta_time", &viz::FrameInfo::delta_time)
         .def_readonly("should_render", &viz::FrameInfo::should_render)
+        .def_readonly("reference_space_changed", &viz::FrameInfo::reference_space_changed)
         .def_readonly("resolution", &viz::FrameInfo::resolution)
         .def_readonly("views", &viz::FrameInfo::views,
                       "Per-eye render target metadata. 2 entries in XR stereo, 1 in window/offscreen. "
@@ -69,6 +73,10 @@ void bind_session(py::module_& m)
         .def_readwrite("xr_far_z", &viz::VizSession::Config::xr_far_z)
         .def_readwrite("required_extensions", &viz::VizSession::Config::required_extensions)
         .def_readwrite("gpu_timing", &viz::VizSession::Config::gpu_timing)
+        .def_readwrite("physical_device_index", &viz::VizSession::Config::physical_device_index,
+                       "Vulkan physical device index to render on; -1 (default) auto-picks. Set it to keep viz on "
+                       "the same GPU as the app's CUDA work — check the result with VizSession.cuda_device_id. "
+                       "Raises for kXr (the runtime picks) or alongside an external context.")
         .def_property(
             "clear_color",
             [](const viz::VizSession::Config& c)
@@ -90,11 +98,38 @@ Top-level Televiz session. Owns the Vulkan context, compositor, and
 layer registry.
 
 Construct via ``VizSession.create(config)``. Add layers with
-``add_quad_layer(config)``. Drive the frame loop with ``render()``
+``add_quad_layer(config)`` (or ``add_cylinder_layer`` / ``add_equirect_layer``
+/ ``add_projection_layer``). Drive the frame loop with ``render()``
 (one-shot) or ``begin_frame()`` / ``end_frame()`` (paired).
 )doc")
-        .def_static("create", &viz::VizSession::create, "config"_a,
-                    "Factory: validates config + initializes Vulkan / display backend.")
+        .def_static(
+            "create",
+            [](const viz::VizSession::Config& config)
+            {
+                struct WaitPollHook
+                {
+                    void (*prev_)();
+                    WaitPollHook()
+                        : prev_(viz::OpenXrSession::set_wait_poll_hook(
+                              []()
+                              {
+                                  py::gil_scoped_acquire gil;
+                                  if (PyErr_CheckSignals() != 0)
+                                  {
+                                      throw py::error_already_set();
+                                  }
+                              }))
+                    {
+                    }
+                    ~WaitPollHook()
+                    {
+                        viz::OpenXrSession::set_wait_poll_hook(prev_);
+                    }
+                } hook;
+                py::gil_scoped_release release;
+                return viz::VizSession::create(config);
+            },
+            "config"_a, "Factory: validates config + initializes Vulkan / display backend.")
         .def("destroy", &viz::VizSession::destroy, py::call_guard<py::gil_scoped_release>())
         .def(
             "add_quad_layer",
@@ -110,6 +145,36 @@ Construct via ``VizSession.create(config)``. Add layers with
             },
             "config"_a, py::return_value_policy::reference_internal,
             "Construct + register a QuadLayer. Returns a non-owning handle.")
+        .def(
+            "add_cylinder_layer",
+            [](viz::VizSession& self, viz::CylinderLayer::Config config) -> viz::CylinderLayer*
+            {
+                const auto* ctx = self.get_vk_context();
+                if (ctx == nullptr)
+                {
+                    throw std::runtime_error("VizSession: cannot add layer before session is initialized");
+                }
+                // Native-only — no render pass; the runtime composites it.
+                return self.add_layer<viz::CylinderLayer>(*ctx, std::move(config));
+            },
+            "config"_a, py::return_value_policy::reference_internal,
+            "Construct + register a CylinderLayer (native XrCompositionLayerCylinderKHR; kXr only). "
+            "Returns a non-owning handle.")
+        .def(
+            "add_equirect_layer",
+            [](viz::VizSession& self, viz::EquirectLayer::Config config) -> viz::EquirectLayer*
+            {
+                const auto* ctx = self.get_vk_context();
+                if (ctx == nullptr)
+                {
+                    throw std::runtime_error("VizSession: cannot add layer before session is initialized");
+                }
+                // Native-only — no render pass; the runtime composites it.
+                return self.add_layer<viz::EquirectLayer>(*ctx, std::move(config));
+            },
+            "config"_a, py::return_value_policy::reference_internal,
+            "Construct + register an EquirectLayer (native XrCompositionLayerEquirect2KHR; kXr only). "
+            "Returns a non-owning handle.")
         .def(
             "add_projection_layer",
             [](viz::VizSession& self, viz::ProjectionLayer::Config config) -> viz::ProjectionLayer*
@@ -130,6 +195,10 @@ Construct via ``VizSession.create(config)``. Add layers with
             "layer"_a, "Remove + destroy a previously added layer (drains the GPU first; no-op if unregistered).")
         .def(
             "remove_layer", [](viz::VizSession& self, viz::QuadLayer* layer) { self.remove_layer(layer); }, "layer"_a)
+        .def(
+            "remove_layer", [](viz::VizSession& self, viz::CylinderLayer* layer) { self.remove_layer(layer); }, "layer"_a)
+        .def(
+            "remove_layer", [](viz::VizSession& self, viz::EquirectLayer* layer) { self.remove_layer(layer); }, "layer"_a)
         .def("render", &viz::VizSession::render, py::call_guard<py::gil_scoped_release>(),
              "Wait + composite + present in one call. Returns FrameInfo.")
         .def("begin_frame", &viz::VizSession::begin_frame, py::call_guard<py::gil_scoped_release>())
@@ -169,7 +238,12 @@ Construct via ``VizSession.create(config)``. Add layers with
             "vk_device", [](const viz::VizSession& s) { return reinterpret_cast<uintptr_t>(s.get_vk_device()); })
         .def_property_readonly("vk_physical_device", [](const viz::VizSession& s)
                                { return reinterpret_cast<uintptr_t>(s.get_vk_physical_device()); })
-        .def_property_readonly("vk_queue_family_index", &viz::VizSession::get_vk_queue_family_index);
+        .def_property_readonly("vk_queue_family_index", &viz::VizSession::get_vk_queue_family_index)
+        .def_property_readonly("cuda_device_id", &viz::VizSession::get_cuda_device_id,
+                               "CUDA device index this session's Vulkan device lives on (matched by UUID). NOT "
+                               "necessarily 0 — Vulkan and CUDA order GPUs differently. Allocate the buffers you "
+                               "submit on THIS device: interop is same-device only, and a mismatch costs a peer "
+                               "copy per submit. -1 after destroy().");
 }
 
 } // namespace viz_py

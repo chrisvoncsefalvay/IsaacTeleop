@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -22,7 +21,7 @@ std::unique_ptr<MessageChannelMcapChannels> LiveMessageChannelTrackerImpl::creat
                                                                                                 std::string_view base_name)
 {
     return std::make_unique<MessageChannelMcapChannels>(
-        writer, base_name, MessageChannelRecordingTraits::schema_name,
+        writer, base_name,
         std::vector<std::string>(
             MessageChannelRecordingTraits::channels.begin(), MessageChannelRecordingTraits::channels.end()));
 }
@@ -60,21 +59,38 @@ void LiveMessageChannelTrackerImpl::update(int64_t monotonic_time_ns)
     last_update_time_ = monotonic_time_ns;
     const XrTime xr_time = time_converter_.convert_monotonic_ns_to_xrtime(monotonic_time_ns);
 
-    messages_.data.clear();
+    MessageChannelMessagesTrackedT native;
 
-    const MessageChannelStatus status = query_status();
-    if (status == MessageChannelStatus::DISCONNECTED)
+    try
     {
-        // Runtime/client disconnected: rebuild the channel object so it can reconnect.
-        try_reopen_channel();
+        const MessageChannelStatus status = query_status();
+        if (status == MessageChannelStatus::DISCONNECTED)
+        {
+            // Runtime/client disconnected: rebuild the channel object so it can reconnect.
+            try_reopen_channel();
+        }
+        else if (status == MessageChannelStatus::CONNECTED)
+        {
+            drain_messages(native);
+        }
+        // For other statuses (CONNECTING / SHUTTING / UNKNOWN), no messages
+        // are drained but the sentinel write below still advances the
+        // replay frame clock.
     }
-    else if (status == MessageChannelStatus::CONNECTED)
+    catch (...)
     {
-        drain_messages();
+        // Publish what was drained before the failure -- those messages came off the
+        // channel and are gone from it. Publishing is also what keeps them from being
+        // delivered twice: without it the handle still holds last frame's batch, and the
+        // next update assembles into a fresh local and re-encodes it.
+        messages_ = pack<MessageChannelMessagesTracked>(native);
+        throw;
     }
-    // For other statuses (CONNECTING / SHUTTING / UNKNOWN), no messages
-    // are drained but the sentinel write below still advances the
-    // replay frame clock.
+
+    // Always encode, including for an empty drain: unlike the single-payload trackers,
+    // `data` here is a list, and "no messages this frame" is an empty batch rather than
+    // an absent one.
+    messages_ = pack<MessageChannelMessagesTracked>(native);
 
     if (mcap_channels_)
     {
@@ -87,21 +103,21 @@ void LiveMessageChannelTrackerImpl::update(int64_t monotonic_time_ns)
         // the replay from the per-frame trackers (head / hand / ...)
         // by the duration of the gap.
         DeviceDataTimestamp timestamp(last_update_time_, last_update_time_, xr_time);
-        if (messages_.data.empty())
+        if (native.data.empty())
         {
-            mcap_channels_->write(0, timestamp, nullptr);
+            mcap_channels_->write(0, pack_record<MessageChannelMessagesRecord>(nullptr, timestamp));
         }
         else
         {
-            for (const auto& msg : messages_.data)
+            for (const auto& msg : native.data)
             {
-                mcap_channels_->write(0, timestamp, msg);
+                mcap_channels_->write(0, pack_record<MessageChannelMessagesRecord>(msg.get(), timestamp));
             }
         }
     }
 }
 
-void LiveMessageChannelTrackerImpl::drain_messages()
+void LiveMessageChannelTrackerImpl::drain_messages(MessageChannelMessagesTrackedT& native)
 {
     while (true)
     {
@@ -111,7 +127,11 @@ void LiveMessageChannelTrackerImpl::drain_messages()
         if (query_result != XR_SUCCESS)
         {
             if (query_result == XR_ERROR_CHANNEL_NOT_CONNECTED_NV)
+                return;
+            if (query_result == XR_ERROR_INSTANCE_LOST)
             {
+                instance_lost_ = true;
+                channel_ = XR_NULL_HANDLE;
                 return;
             }
             throw std::runtime_error("LiveMessageChannelTrackerImpl: xrReceiveOpaqueDataChannelNV (query) failed, result=" +
@@ -128,8 +148,7 @@ void LiveMessageChannelTrackerImpl::drain_messages()
             // Drain the oversized message to unblock the queue, but discard the data.
             // Read in bounded chunks using the pre-allocated receive_buffer_ to avoid
             // allocating a buffer sized by the untrusted remote-supplied count_out.
-            std::cerr << "[LiveMessageChannelTrackerImpl] Dropping oversized message (" << count_out << " bytes, max "
-                      << tracker_->max_message_size() << ")" << std::endl;
+            logger_->warn("Dropping oversized message ({} bytes, max {})", count_out, tracker_->max_message_size());
             uint32_t remaining = count_out;
             while (remaining > 0)
             {
@@ -156,7 +175,11 @@ void LiveMessageChannelTrackerImpl::drain_messages()
         if (recv_result != XR_SUCCESS)
         {
             if (recv_result == XR_ERROR_CHANNEL_NOT_CONNECTED_NV)
+                return;
+            if (recv_result == XR_ERROR_INSTANCE_LOST)
             {
+                instance_lost_ = true;
+                channel_ = XR_NULL_HANDLE;
                 return;
             }
             throw std::runtime_error("LiveMessageChannelTrackerImpl: xrReceiveOpaqueDataChannelNV (read) failed, result=" +
@@ -165,7 +188,7 @@ void LiveMessageChannelTrackerImpl::drain_messages()
 
         auto message = std::make_shared<MessageChannelMessagesT>();
         message->payload.assign(receive_buffer_.begin(), receive_buffer_.begin() + read_count);
-        messages_.data.push_back(message);
+        native.data.push_back(message);
     }
 }
 
@@ -174,7 +197,7 @@ MessageChannelStatus LiveMessageChannelTrackerImpl::get_status() const
     return query_status();
 }
 
-const MessageChannelMessagesTrackedT& LiveMessageChannelTrackerImpl::get_messages() const
+const Serialized<MessageChannelMessagesTracked>& LiveMessageChannelTrackerImpl::get_messages() const
 {
     return messages_;
 }
@@ -197,6 +220,11 @@ void LiveMessageChannelTrackerImpl::send_message(const std::vector<uint8_t>& pay
     XrResult state_result = get_state_fn_(channel_, &channel_state);
     if (state_result != XR_SUCCESS)
     {
+        if (state_result == XR_ERROR_INSTANCE_LOST)
+        {
+            instance_lost_ = true;
+            channel_ = XR_NULL_HANDLE;
+        }
         throw std::runtime_error("LiveMessageChannelTrackerImpl: xrGetOpaqueDataChannelStateNV failed, result=" +
                                  std::to_string(state_result));
     }
@@ -209,6 +237,11 @@ void LiveMessageChannelTrackerImpl::send_message(const std::vector<uint8_t>& pay
     XrResult send_result = send_fn_(channel_, static_cast<uint32_t>(payload.size()), payload_ptr);
     if (send_result != XR_SUCCESS)
     {
+        if (send_result == XR_ERROR_INSTANCE_LOST)
+        {
+            instance_lost_ = true;
+            channel_ = XR_NULL_HANDLE;
+        }
         throw std::runtime_error("LiveMessageChannelTrackerImpl: xrSendOpaqueDataChannelNV failed, result=" +
                                  std::to_string(send_result));
     }
@@ -255,6 +288,10 @@ void LiveMessageChannelTrackerImpl::create_channel()
     XrResult result = create_channel_fn_(handles_.instance, &create_info, &channel_);
     if (result != XR_SUCCESS)
     {
+        // INSTANCE_LOST and RUNTIME_FAILURE both indicate the IPC connection
+        // to the runtime is gone; suppress further reopen attempts.
+        if (result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_RUNTIME_FAILURE)
+            instance_lost_ = true;
         throw std::runtime_error("LiveMessageChannelTrackerImpl: xrCreateOpaqueDataChannelNV failed, result=" +
                                  std::to_string(result));
     }
@@ -263,26 +300,29 @@ void LiveMessageChannelTrackerImpl::create_channel()
 void LiveMessageChannelTrackerImpl::destroy_channel() noexcept
 {
     if (channel_ == XR_NULL_HANDLE)
-    {
         return;
-    }
 
-    if (shutdown_fn_)
+    if (!instance_lost_)
     {
-        XrResult result = shutdown_fn_(channel_);
-        if (result != XR_SUCCESS)
+        if (shutdown_fn_)
         {
-            std::cerr << "[LiveMessageChannelTrackerImpl] xrShutdownOpaqueDataChannelNV failed, result=" << result
-                      << std::endl;
+            XrResult result = shutdown_fn_(channel_);
+            if (result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_RUNTIME_FAILURE)
+            {
+                instance_lost_ = true;
+                channel_ = XR_NULL_HANDLE;
+                return;
+            }
+            if (result != XR_SUCCESS)
+                logger_->warn("xrShutdownOpaqueDataChannelNV failed, result={}", static_cast<int>(result));
         }
-    }
-    if (destroy_channel_fn_)
-    {
-        XrResult result = destroy_channel_fn_(channel_);
-        if (result != XR_SUCCESS)
+        if (destroy_channel_fn_)
         {
-            std::cerr << "[LiveMessageChannelTrackerImpl] xrDestroyOpaqueDataChannelNV failed, result=" << result
-                      << std::endl;
+            XrResult result = destroy_channel_fn_(channel_);
+            if (result == XR_ERROR_INSTANCE_LOST || result == XR_ERROR_RUNTIME_FAILURE)
+                instance_lost_ = true;
+            else if (result != XR_SUCCESS)
+                logger_->warn("xrDestroyOpaqueDataChannelNV failed, result={}", static_cast<int>(result));
         }
     }
     channel_ = XR_NULL_HANDLE;
@@ -290,6 +330,8 @@ void LiveMessageChannelTrackerImpl::destroy_channel() noexcept
 
 bool LiveMessageChannelTrackerImpl::try_reopen_channel()
 {
+    if (instance_lost_)
+        return false;
     try
     {
         destroy_channel();
@@ -298,17 +340,15 @@ bool LiveMessageChannelTrackerImpl::try_reopen_channel()
     }
     catch (const std::exception& e)
     {
-        std::cerr << "[LiveMessageChannelTrackerImpl] Failed to reopen message channel: " << e.what() << std::endl;
+        logger_->warn("Failed to reopen message channel: {}", e.what());
         return false;
     }
 }
 
 MessageChannelStatus LiveMessageChannelTrackerImpl::query_status() const
 {
-    if (channel_ == XR_NULL_HANDLE)
+    if (instance_lost_ || channel_ == XR_NULL_HANDLE)
     {
-        // Channel was destroyed (e.g. failed reopen); report DISCONNECTED so
-        // update() will schedule a reopen attempt on the next frame.
         return MessageChannelStatus::DISCONNECTED;
     }
 
@@ -316,8 +356,12 @@ MessageChannelStatus LiveMessageChannelTrackerImpl::query_status() const
     XrResult state_result = get_state_fn_(channel_, &channel_state);
     if (state_result != XR_SUCCESS)
     {
-        throw std::runtime_error("LiveMessageChannelTrackerImpl: xrGetOpaqueDataChannelStateNV failed, result=" +
-                                 std::to_string(state_result));
+        // Only permanently disable the channel on fatal runtime-loss errors;
+        // transient failures return DISCONNECTED to allow a reopen attempt.
+        if (state_result == XR_ERROR_INSTANCE_LOST || state_result == XR_ERROR_RUNTIME_FAILURE)
+            instance_lost_ = true;
+        channel_ = XR_NULL_HANDLE;
+        return MessageChannelStatus::DISCONNECTED;
     }
 
     switch (channel_state.state)

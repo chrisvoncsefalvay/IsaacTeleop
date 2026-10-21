@@ -5,11 +5,11 @@
 
 #include <mcap/recording_traits.hpp>
 #include <schema/head_bfbs_generated.h>
+#include <schema/serialized.hpp>
 #include <schema/timestamp_generated.h>
 
 #include <cassert>
 #include <cstring>
-#include <iostream>
 
 namespace core
 {
@@ -18,16 +18,20 @@ namespace core
 // ReplayHeadTrackerImpl
 // ============================================================================
 
-ReplayHeadTrackerImpl::ReplayHeadTrackerImpl(std::unique_ptr<mcap::McapReader> reader, std::string_view base_name)
+ReplayHeadTrackerImpl::ReplayHeadTrackerImpl(std::unique_ptr<mcap::McapReader> reader,
+                                             std::string_view base_name,
+                                             const RecordedSchemas& recorded)
     : mcap_viewers_(
           std::make_unique<HeadMcapViewers>(std::move(reader),
                                             base_name,
                                             std::vector<std::string>(HeadRecordingTraits::replay_channels.begin(),
-                                                                     HeadRecordingTraits::replay_channels.end())))
+                                                                     HeadRecordingTraits::replay_channels.end()),
+                                            recorded)),
+      logger_(isaaccapture::Logger::get("isaaccapture.core.ReplayHeadTrackerImpl"))
 {
 }
 
-const HeadPoseTrackedT& ReplayHeadTrackerImpl::get_head() const
+const Serialized<HeadPose>& ReplayHeadTrackerImpl::get_head() const
 {
     return tracked_;
 }
@@ -37,12 +41,17 @@ void ReplayHeadTrackerImpl::update(int64_t /*monotonic_time_ns*/)
     auto record = mcap_viewers_->read(0);
     if (record)
     {
-        tracked_.data = std::move(record->data);
+        tracked_ = record.narrow(record->data());
+        warned_no_data_ = false;
     }
     else
     {
-        std::cerr << "ReplayHeadTrackerImpl: head data not found" << std::endl;
-        tracked_.data.reset();
+        if (!warned_no_data_)
+        {
+            logger_->warn("head data not found");
+            warned_no_data_ = true;
+        }
+        tracked_.reset();
     }
 }
 

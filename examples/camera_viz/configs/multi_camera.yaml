@@ -45,13 +45,17 @@ cameras:
       bitrate_mbps: 15
 
 display:
-  mode: xr                      # window | xr
+  mode: xr                      # xr | window (xr is the default)
   window:                       # used only if mode: window
     width: 2560
     height: 720
   xr:
     near_z: 0.05
     far_z: 100.0
+    # How long create() waits for the headset to connect. -1 (default) waits
+    # forever, so you can start the viewer before putting the Quest on; 0
+    # fails fast.
+    system_wait_seconds: -1
   clear_color: [0.0, 0.0, 0.0, 0.0]
   placements:
     zed:

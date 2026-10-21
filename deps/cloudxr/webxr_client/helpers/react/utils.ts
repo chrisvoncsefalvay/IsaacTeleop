@@ -29,7 +29,7 @@ export function loadPerProject<T>(
   key: string,
   teleopPath: string,
   parse: (raw: string) => T | undefined,
-  fallback: T,
+  fallback: T
 ): T {
   try {
     const stored = localStorage.getItem(`cxr.isaac.${key}|${teleopPath}`);
@@ -48,7 +48,7 @@ export function savePerProject<T>(
   key: string,
   teleopPath: string,
   value: T,
-  serialize: (v: T) => string = String,
+  serialize: (v: T) => string = String
 ): void {
   try {
     localStorage.setItem(`cxr.isaac.${key}|${teleopPath}`, serialize(value));
@@ -60,12 +60,38 @@ export function savePerProject<T>(
 /** React UI options (e.g. in-XR control panel position). */
 export interface ReactUIConfig {
   controlPanelPosition?: ControlPanelPosition;
+  /** Distance from viewer to panel (meters). Overrides the default in ControlPanelLayoutOptions. */
+  controlPanelDistance?: number;
+  /** Height of panel, floor-relative (meters). Overrides the default in ControlPanelLayoutOptions. */
+  controlPanelHeight?: number;
+  /** Angle in degrees for left/right positions from center. Overrides the default in ControlPanelLayoutOptions. */
+  controlPanelAngleDegrees?: number;
+  /** When true, the control panel continuously follows the headset instead of staying at a
+   * fixed room position. Dragging still works while this is on - it updates the tracked
+   * head-relative offset instead of a fixed room position. */
+  controlPanelTrackHeadset?: boolean;
   /** When true, the control panel is hidden at immersive XR enter (small “show control panel” control only). */
   panelHiddenAtStart?: boolean;
   /** When true, all WebGL rendering is skipped. */
   headless?: boolean;
   /** Page-refresh behavior when the XR session ends. See {@link AutoRefreshMode}. */
   autoRefreshMode?: AutoRefreshMode;
+  /** When true, CloudXRComponent retries a recoverable stream error instead of giving up immediately. */
+  reconnectEnabled?: boolean;
+  /** Max retry attempts before giving up. Only used when reconnectEnabled is true. */
+  reconnectMaxAttempts?: number;
+  /** Delay between retry attempts in milliseconds. Only used when reconnectEnabled is true. */
+  reconnectDelayMs?: number;
+  /** Base timeout (ms) for "passthrough-only" detection (session entered XR but the stream never
+   * attached). Independent of reconnectEnabled - detection always runs; doubles per retry
+   * attempt when reconnect is also on. See CloudXRComponent's streamAttachTimeoutMs prop. */
+  streamAttachTimeoutMs?: number;
+  /** Timeout (ms) for detecting a stream that attached but produced no decoder warm-up signal at
+   * all. Does not grow per retry attempt. See CloudXRComponent's warmupBeginTimeoutMs prop. */
+  warmupBeginTimeoutMs?: number;
+  /** Timeout (ms) for detecting decoder warm-up that began but never finished. Does not grow per
+   * retry attempt. See CloudXRComponent's warmupEndTimeoutMs prop. */
+  warmupEndTimeoutMs?: number;
   /** Active teleop project path (a key path in `TELEOP_PROJECTS`). */
   teleopPath: string;
 }
@@ -86,6 +112,26 @@ export function parseAutoRefreshMode(
 ): AutoRefreshMode {
   if (AUTO_REFRESH_MODES.includes(unvalidatedValue as AutoRefreshMode)) {
     return unvalidatedValue as AutoRefreshMode;
+  }
+  return fallback;
+}
+
+/** Pre-stream network test mode: skip it, measure and report, or measure and gate on it. */
+export type StreamTestMode = 'off' | 'warn' | 'block';
+
+const STREAM_TEST_MODES: readonly StreamTestMode[] = ['off', 'warn', 'block'];
+
+/**
+ * Parses a string into a valid network test mode.
+ * @param unvalidatedValue - String to validate (e.g. from URL, config, or form). May be invalid or empty.
+ * @param fallback - Value to return when unvalidatedValue is not valid.
+ */
+export function parseStreamTestMode(
+  unvalidatedValue: string,
+  fallback: StreamTestMode
+): StreamTestMode {
+  if (STREAM_TEST_MODES.includes(unvalidatedValue as StreamTestMode)) {
+    return unvalidatedValue as StreamTestMode;
   }
   return fallback;
 }

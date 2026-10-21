@@ -66,6 +66,19 @@ public:
         // alpha=0 lets a non-opaque background show through.
         float clear_color[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
 
+        // Which Vulkan physical device to render on, as an index into
+        // vkEnumeratePhysicalDevices. -1 (default) auto-picks the
+        // highest-scoring suitable device. Set it to put viz on the same
+        // GPU as the rest of an app — auto-pick knows nothing about where
+        // the app's CUDA work already lives, and a split costs a peer
+        // copy on every submit. Pair with get_cuda_device_id() to check
+        // where you landed.
+        //
+        // Rejected (throws) for kXr, where the OpenXR runtime dictates
+        // the device, and with external_context, which was already
+        // created on some device.
+        int physical_device_index = -1;
+
         // Optional pre-built Vulkan context. If non-null, MUST already
         // have the backend's extensions enabled (VK_KHR_swapchain +
         // surface for kWindow, OpenXR-Vulkan for kXr) — backend init
@@ -109,10 +122,13 @@ public:
     // as the frame loop; only LayerBase::set_visible() is atomic.
     //
     // Layer-mode invariant (for now): a session holds EITHER one
-    // ProjectionLayer OR any number of QuadLayers, never both. The
-    // ProjectionLayer is direct-present (copied straight to the swapchain),
-    // while QuadLayers composite into the shared render target — the two
-    // paths don't coexist yet. Violations throw std::invalid_argument.
+    // ProjectionLayer OR any number of texture layers (QuadLayer /
+    // CylinderLayer / EquirectLayer), never both. The ProjectionLayer is
+    // direct-present (copied straight to the swapchain), while texture
+    // layers submit as native XR composition layers by default (kXr,
+    // openxr_composition = true) or draw into the shared render target
+    // (fallback / window / offscreen) — neither coexists with the direct
+    // path yet. Violations throw std::invalid_argument.
     template <typename L, typename... Args>
     L* add_layer(Args&&... args)
     {
@@ -182,6 +198,16 @@ public:
     uint32_t get_vk_queue_family_index() const noexcept;
     VkRenderPass get_render_pass() const noexcept;
     const VkContext* get_vk_context() const noexcept;
+
+    // CUDA device index this session's Vulkan device lives on, matched by
+    // UUID (VkContext::match_cuda_device_to_vulkan). NOT necessarily 0:
+    // Vulkan and CUDA enumerate GPUs in different orders, so on a
+    // multi-GPU machine the auto-picked Vulkan device routinely maps to a
+    // non-zero CUDA index. Callers producing buffers for submit() should
+    // allocate and launch on THIS device — anything else costs a peer
+    // copy per submit, and CUDA-Vulkan interop is same-device only.
+    // -1 before init / after destroy.
+    int get_cuda_device_id() const noexcept;
 
     // True when the display target has been asked to close (window-X
     // clicked, etc.). Always false in kOffscreen / kXr.

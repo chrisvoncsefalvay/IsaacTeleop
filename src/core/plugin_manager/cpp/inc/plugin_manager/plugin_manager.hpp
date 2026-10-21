@@ -4,6 +4,8 @@
 #pragma once
 #include "plugin.hpp"
 
+#include <log_bridge/logger.hpp>
+
 #include <map>
 #include <memory>
 #include <string>
@@ -26,6 +28,7 @@ struct PluginInfo
     std::string command;
     std::string version;
     std::string working_dir;
+    std::vector<std::string> args;
     std::vector<DeviceInfo> devices;
 };
 
@@ -45,6 +48,13 @@ public:
     std::vector<std::string> get_plugin_names() const;
 
     /**
+     * @brief Get the complete immutable descriptor for a discovered plugin.
+     * @param plugin_name The name of the plugin to query.
+     * @return A copy of the plugin metadata and device descriptors.
+     */
+    PluginInfo get_plugin_info(const std::string& plugin_name) const;
+
+    /**
      * @brief Query available devices from a plugin.
      * @param plugin_name The name of the plugin to query.
      * @return List of device paths from the plugin metadata.
@@ -55,7 +65,7 @@ public:
      * @brief Start a plugin and return a RAII handle.
      * @param plugin_name The name of the plugin to start.
      * @param plugin_root_id The root ID for the plugin.
-     * @param plugin_args Optional arguments passed to the plugin process.
+     * @param plugin_args Optional arguments appended after plugin.yaml args.
      * @return A unique pointer to the Plugin instance (stops on destruction).
      */
     std::unique_ptr<Plugin> start(const std::string& plugin_name,
@@ -67,6 +77,7 @@ private:
 
     std::vector<std::string> m_search_paths;
     std::map<std::string, PluginInfo> m_discovered_plugins;
+    std::shared_ptr<spdlog::logger> m_logger = isaaccapture::Logger::get("isaaccapture.core.PluginManager");
 };
 
 } // namespace core

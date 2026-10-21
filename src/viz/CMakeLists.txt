@@ -8,8 +8,8 @@ cmake_minimum_required(VERSION 3.20)
 # ==============================================================================
 #
 # Televiz mirrors the structure of src/core: a container of sub-modules, each
-# with its own static library and (when needed) a sibling <module>_tests/
-# directory.
+# with its own static library. Tests live under tests/cpp/viz/ and
+# tests/python/viz/ (see tests/AGENTS.md).
 #
 # Sub-modules (planned):
 #   core     — Vulkan + CUDA infrastructure, foundational types
@@ -31,6 +31,13 @@ cmake_minimum_required(VERSION 3.20)
 # Core: Vulkan/CUDA infrastructure and foundational types.
 add_subdirectory(core)
 
+# Robot twin: MuJoCo's renderer read back into CUDA, over a private MuJoCo. The whole
+# sub-module is one pybind11 extension and no viz:: target links it, so it goes with the
+# bindings rather than with Televiz.
+if(BUILD_PYTHON_BINDINGS)
+    add_subdirectory(robot_twin/cpp)
+endif()
+
 # XR: OpenXR-bound graphics session + XrBackend.
 add_subdirectory(xr)
 
@@ -50,21 +57,4 @@ add_subdirectory(layers)
 # Python bindings (stub today; pybind11 module added later).
 if(BUILD_PYTHON_BINDINGS)
     add_subdirectory(python)
-endif()
-
-# Tests for each sub-module live in <module>_tests/ siblings. Shared test
-# fixtures are their own one-target leaf modules, processed first so the
-# *_tests executables can resolve their aliases at the link call.
-if(BUILD_TESTING)
-    add_subdirectory(test_support)
-    add_subdirectory(layers_testing)
-
-    add_subdirectory(core_tests)
-    add_subdirectory(layers_tests)
-    add_subdirectory(session_tests)
-    add_subdirectory(shaders_tests)
-    add_subdirectory(xr_tests)
-    if(BUILD_PYTHON_BINDINGS)
-        add_subdirectory(python_tests)
-    endif()
 endif()

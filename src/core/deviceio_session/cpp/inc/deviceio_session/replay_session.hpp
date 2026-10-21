@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deviceio_base/tracker.hpp>
+#include <log_bridge/logger.hpp>
 
 #include <memory>
 #include <stdexcept>
@@ -28,6 +29,8 @@ namespace core
  */
 struct McapReplayConfig
 {
+    //! Recording to replay. Empty for a session whose trackers are all push-fed, which reads
+    //! no recording; a name that cannot be opened is an error either way.
     std::string filename;
     std::vector<std::pair<const ITracker*, std::string>> tracker_names;
 };
@@ -60,6 +63,7 @@ public:
 private:
     explicit ReplaySession(const McapReplayConfig& config);
 
+    std::shared_ptr<spdlog::logger> logger_ = isaaccapture::Logger::get("isaaccapture.core.ReplaySession");
     std::unordered_map<const ITracker*, std::unique_ptr<ITrackerImpl>> tracker_impls_;
 };
 

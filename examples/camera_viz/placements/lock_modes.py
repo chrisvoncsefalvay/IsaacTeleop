@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""World / head / lazy locked placement strategies."""
+"""World / head / lazy / gimbal locked placement strategies."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from ._math import (
     angle_between_xz_deg,
     normalize_angle,
     project_forward_xz,
-    quat_mul,
     rotate_vec,
     smoothstep,
     yaw_quat,
@@ -43,11 +42,24 @@ class PlacementConfig:
 
 @dataclass
 class Placement:
-    """Output of a strategy: feeds straight into ``viz.QuadLayerPlacement``."""
+    """Output of a strategy.
+
+    ``position`` / ``orientation`` / ``size_meters`` feed straight into
+    ``viz.QuadLayerPlacement``. ``anchor_position`` / ``anchor_orientation``
+    are the head-anchored pose ``distance`` behind the plane, oriented so
+    local −z points at the plane — the pose a curved surface centered on
+    the viewer (``viz.CylinderLayerPlacement``) should use. Each strategy
+    computes the anchor itself because the facing conventions differ
+    (world/lazy/gimbal build yaw-only quats whose +z faces the head;
+    head-locked uses the full head orientation, pitch and roll included).
+    """
 
     position: Vec3
     orientation: Quat  # (w, x, y, z)
     size_meters: Tuple[float, float]
+    distance: float = 1.5
+    anchor_position: Vec3 = (0.0, 0.0, 0.0)
+    anchor_orientation: Quat = (1.0, 0.0, 0.0, 0.0)
 
 
 class PlacementStrategy(ABC):
@@ -56,6 +68,16 @@ class PlacementStrategy(ABC):
 
     @abstractmethod
     def update(self, head_pos: Vec3, head_orientation: Quat) -> Placement: ...
+
+    def retune(self, config: PlacementConfig) -> None:
+        """Swap the tuning without resetting the strategy's live state.
+
+        ``PlacementConfig`` is frozen, so a caller adjusting size or
+        distance at runtime builds a replacement with ``dataclasses.replace``
+        and hands it over here. Rebuilding the strategy instead would drop
+        the lazy anchor and re-snap the plane on every change.
+        """
+        self._config = config
 
 
 def _target_position(head_pos: Vec3, forward_xz: Vec3, cfg: PlacementConfig) -> Vec3:
@@ -70,6 +92,10 @@ def _target_position(head_pos: Vec3, forward_xz: Vec3, cfg: PlacementConfig) -> 
     )
 
 
+def _shift_y(position: Vec3, delta: float) -> Vec3:
+    return (position[0], position[1] + delta, position[2])
+
+
 def _yaw_to_face(target: Vec3, plane_pos: Vec3) -> float:
     """Yaw rotation that aims the plane's front at ``target``.
     Mirrors ``CameraPlane::compute_yaw_to_face``."""
@@ -82,25 +108,39 @@ class WorldLocked(PlacementStrategy):
 
     def __init__(self, config: PlacementConfig) -> None:
         self._config = config
-        self._cached: Optional[Placement] = None
+        # The head pose the plane was placed around, frozen on first update.
+        # Everything else is recomputed from it each frame so a retune (size,
+        # height) takes effect at once; caching the finished Placement instead
+        # made this mode ignore retuning entirely.
+        self._anchor_head: Optional[Vec3] = None
+        self._anchor_forward_xz: Optional[Vec3] = None
 
     def update(self, head_pos: Vec3, head_orientation: Quat) -> Placement:
-        if self._cached is None:
-            forward_xz = project_forward_xz(head_orientation)
-            position = _target_position(head_pos, forward_xz, self._config)
-            yaw = _yaw_to_face(head_pos, position)
-            self._cached = Placement(position, yaw_quat(yaw), self._config.size_meters)
-        return self._cached
+        if self._anchor_head is None:
+            self._anchor_head = head_pos
+            self._anchor_forward_xz = project_forward_xz(head_orientation)
 
-
-# 180° about +Y: rotates the quad to face back at the user.
-_ROT_Y_180: Quat = (0.0, 0.0, 1.0, 0.0)
+        position = _target_position(
+            self._anchor_head, self._anchor_forward_xz, self._config
+        )
+        orientation = yaw_quat(_yaw_to_face(self._anchor_head, position))
+        # Anchor = the head point the plane was placed around: push the plane
+        # back along its local +z (which faces the head).
+        back = rotate_vec(orientation, (0.0, 0.0, 1.0))
+        anchor = tuple(position[i] + back[i] * self._config.distance for i in range(3))
+        return Placement(
+            position,
+            orientation,
+            self._config.size_meters,
+            self._config.distance,
+            anchor,
+            orientation,
+        )
 
 
 class HeadLocked(PlacementStrategy):
-    """Follow the head every frame, full 6-DoF.
-    Mirrors ``CameraPlane::update_head`` + the ``head_rotation * rotY(π)``
-    in ``CameraPlane::rotation``."""
+    """Follow the head every frame, full 6-DoF (pitch and roll included,
+    unlike the yaw-only world / gimbal / lazy modes)."""
 
     def __init__(self, config: PlacementConfig) -> None:
         self._config = config
@@ -115,8 +155,61 @@ class HeadLocked(PlacementStrategy):
             head_pos[1] + forward[1] * d + right[1] * ox + up[1] * oy,
             head_pos[2] + forward[2] * d + right[2] * ox + up[2] * oy,
         )
-        orientation = quat_mul(head_orientation, _ROT_Y_180)
-        return Placement(position, orientation, self._config.size_meters)
+        # No flip: every mode returns the rotation that faces the plane back
+        # at the viewer, which is identity for a level head. Rotating by 180
+        # deg here pointed the quad away, and an OpenXR quad layer is
+        # single-sided, so the feed went black.
+        orientation = head_orientation
+        # Anchor = the head itself (plus the configured offsets, already
+        # baked into ``position``): pull the plane back by ``distance``.
+        anchor = (
+            position[0] - forward[0] * d,
+            position[1] - forward[1] * d,
+            position[2] - forward[2] * d,
+        )
+        return Placement(
+            position,
+            orientation,
+            self._config.size_meters,
+            self._config.distance,
+            anchor,
+            head_orientation,
+        )
+
+
+class GimbalLocked(PlacementStrategy):
+    """Translation head-locked, rotation world-locked: the surface follows
+    your position every frame but keeps the yaw captured at first sight —
+    walk and it comes with you, turn your head and you look around it.
+    The "virtual gimbal" mode for wide cylinder feeds."""
+
+    def __init__(self, config: PlacementConfig) -> None:
+        self._config = config
+        self._forward_xz: Optional[Vec3] = None
+        self._yaw = 0.0
+
+    def update(self, head_pos: Vec3, head_orientation: Quat) -> Placement:
+        if self._forward_xz is None:
+            # Capture the world-locked heading once: face where the user
+            # is looking at first update.
+            self._forward_xz = project_forward_xz(head_orientation)
+            probe = _target_position(head_pos, self._forward_xz, self._config)
+            self._yaw = _yaw_to_face(head_pos, probe)
+        position = _target_position(head_pos, self._forward_xz, self._config)
+        orientation = yaw_quat(self._yaw)
+        # Anchor = the head itself (plus offsets, already baked into
+        # ``position``): pull back along the fixed heading.
+        anchor = tuple(
+            position[i] - self._forward_xz[i] * self._config.distance for i in range(3)
+        )
+        return Placement(
+            position,
+            orientation,
+            self._config.size_meters,
+            self._config.distance,
+            anchor,
+            orientation,
+        )
 
 
 class LazyLocked(PlacementStrategy):
@@ -140,6 +233,23 @@ class LazyLocked(PlacementStrategy):
         self._target_position: Vec3 = (0.0, 0.0, 0.0)
         self._target_yaw = 0.0
 
+    def retune(self, config: PlacementConfig) -> None:
+        """Carry a height change onto the position already placed.
+
+        Unlike the other modes this one cannot recompute from an anchor -- its
+        position is wherever the last re-snap and transition left it. Without
+        this, a height change sat unapplied until the next re-snap, which is
+        the whole point of lazy mode not happening.
+        """
+        delta_y = config.offset_y - self._config.offset_y
+        super().retune(config)
+        if delta_y:
+            self._position = _shift_y(self._position, delta_y)
+            self._target_position = _shift_y(self._target_position, delta_y)
+            self._transition_start_position = _shift_y(
+                self._transition_start_position, delta_y
+            )
+
     def update(self, head_pos: Vec3, head_orientation: Quat) -> Placement:
         now = time.monotonic()
         forward_xz = project_forward_xz(head_orientation)
@@ -150,9 +260,7 @@ class LazyLocked(PlacementStrategy):
             self._yaw = _yaw_to_face(head_pos, self._position)
             self._target_yaw = self._yaw
             self._initialized = True
-            return Placement(
-                self._position, yaw_quat(self._yaw), self._config.size_meters
-            )
+            return self._placement()
 
         # Look-away check: angle between head forward and head→plane vector.
         head_to_plane = (
@@ -201,17 +309,38 @@ class LazyLocked(PlacementStrategy):
                 self._is_transitioning = False
                 self._is_looking_away = False
 
-        return Placement(self._position, yaw_quat(self._yaw), self._config.size_meters)
+        return self._placement()
+
+    def _placement(self) -> Placement:
+        """Current (possibly mid-transition) pose as a Placement. The anchor
+        glides with the smoothed plane pose so a cylinder re-snaps along the
+        same eased path a quad does."""
+        orientation = yaw_quat(self._yaw)
+        back = rotate_vec(orientation, (0.0, 0.0, 1.0))
+        anchor = tuple(
+            self._position[i] + back[i] * self._config.distance for i in range(3)
+        )
+        return Placement(
+            self._position,
+            orientation,
+            self._config.size_meters,
+            self._config.distance,
+            anchor,
+            orientation,
+        )
 
 
 def build(lock_mode: str, config: PlacementConfig) -> PlacementStrategy:
     """Factory used by the YAML loader.
 
-    ``"world"`` → WorldLocked, ``"head"`` → HeadLocked, anything else
-    (including ``"lazy"``) → LazyLocked.
+    ``"world"`` → WorldLocked, ``"head"`` → HeadLocked, ``"gimbal"`` →
+    GimbalLocked (translation follows the head, rotation stays
+    world-locked), anything else (including ``"lazy"``) → LazyLocked.
     """
     if lock_mode == "world":
         return WorldLocked(config)
     if lock_mode == "head":
         return HeadLocked(config)
+    if lock_mode == "gimbal":
+        return GimbalLocked(config)
     return LazyLocked(config)

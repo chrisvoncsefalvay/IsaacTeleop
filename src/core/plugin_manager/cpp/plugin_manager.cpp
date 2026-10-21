@@ -5,7 +5,6 @@
 
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <sstream>
 
 #include <yaml-cpp/yaml.h>
@@ -33,6 +32,13 @@ static PluginInfo parse_plugin_yaml(const std::string& path)
             info.command = config["command"].as<std::string>();
         if (config["version"])
             info.version = config["version"].as<std::string>();
+        if (config["args"] && config["args"].IsSequence())
+        {
+            for (const auto& arg_node : config["args"])
+            {
+                info.args.push_back(arg_node.as<std::string>());
+            }
+        }
 
         // Parse devices list
         if (config["devices"] && config["devices"].IsSequence())
@@ -86,6 +92,16 @@ std::vector<std::string> PluginManager::get_plugin_names() const
     return names;
 }
 
+PluginInfo PluginManager::get_plugin_info(const std::string& plugin_name) const
+{
+    const auto it = m_discovered_plugins.find(plugin_name);
+    if (it == m_discovered_plugins.end())
+    {
+        throw std::runtime_error("Plugin not found: " + plugin_name);
+    }
+    return it->second;
+}
+
 void PluginManager::discover_plugins()
 {
     m_discovered_plugins.clear();
@@ -117,7 +133,7 @@ void PluginManager::discover_plugins()
                         }
                         catch (const std::exception& e)
                         {
-                            std::cerr << "Error parsing metadata for " << plugin_dir << ": " << e.what() << std::endl;
+                            m_logger->error("Error parsing metadata for {}: {}", plugin_dir.string(), e.what());
                         }
                     }
                 }
@@ -125,20 +141,14 @@ void PluginManager::discover_plugins()
         }
         catch (const std::exception& e)
         {
-            std::cerr << "Error scanning directory " << base_path << ": " << e.what() << std::endl;
+            m_logger->error("Error scanning directory {}: {}", base_path, e.what());
         }
     }
 }
 
 std::vector<std::string> PluginManager::query_devices(const std::string& plugin_name) const
 {
-    auto it = m_discovered_plugins.find(plugin_name);
-    if (it == m_discovered_plugins.end())
-    {
-        throw std::runtime_error("Plugin not found: " + plugin_name);
-    }
-
-    const auto& info = it->second;
+    const PluginInfo info = get_plugin_info(plugin_name);
     std::vector<std::string> result;
     result.reserve(info.devices.size());
     for (const auto& device : info.devices)
@@ -159,7 +169,9 @@ std::unique_ptr<Plugin> PluginManager::start(const std::string& plugin_name,
     }
 
     const auto& info = it->second;
-    return std::make_unique<Plugin>(info.command, info.working_dir, plugin_root_id, plugin_args);
+    std::vector<std::string> args = info.args;
+    args.insert(args.end(), plugin_args.begin(), plugin_args.end());
+    return std::make_unique<Plugin>(info.command, info.working_dir, plugin_root_id, args);
 }
 
 } // namespace core

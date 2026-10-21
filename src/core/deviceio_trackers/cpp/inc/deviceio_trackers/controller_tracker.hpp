@@ -21,10 +21,10 @@ public:
     }
 
     // Query methods:
-    // - tracked.data is null when the controller is inactive.
-    // - when tracked.data is non-null, nested fields in ControllerSnapshotT are safe to read.
-    const ControllerSnapshotTrackedT& get_left_controller(const ITrackerSession& session) const;
-    const ControllerSnapshotTrackedT& get_right_controller(const ITrackerSession& session) const;
+    // - the handle is empty when the controller is inactive.
+    // - when it is non-empty, nested fields in ControllerSnapshot are safe to read.
+    const Serialized<ControllerSnapshot>& get_left_controller(const ITrackerSession& session) const;
+    const Serialized<ControllerSnapshot>& get_right_controller(const ITrackerSession& session) const;
 
     /// Drive the left/right controller's haptic actuator for one frame.
     ///
@@ -33,7 +33,7 @@ public:
     /// hardware (the side is chosen by which method you call, not a parameter).
     ///
     /// Bridges Isaac Teleop's haptic feedback flow (see
-    /// isaacteleop.haptic_devices.controller.ControllerHapticDevice) to the
+    /// isaaccapture.haptic_devices.controller.ControllerHapticDevice) to the
     /// underlying runtime impl. Vendor neutral at this layer; concrete impls
     /// (e.g. the live OpenXR impl) translate to runtime-specific calls.
     ///

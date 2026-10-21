@@ -28,7 +28,7 @@ from typing import Optional
 
 from .rtp_h264_receiver import _ensure_gst_initialized
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("isaaccapture.camera_viz.transports.rtp_h264_sender")
 
 RECONNECT_DELAY_S = 2.0
 
@@ -252,7 +252,7 @@ class RtpH264Sender:
                     raise RuntimeError(
                         f"RtpH264Sender: encode failed {consecutive_encode_failures} "
                         f"times in a row; surfacing to supervisor for full restart"
-                    )
+                    ) from e
                 continue
 
             for pkt in packets:

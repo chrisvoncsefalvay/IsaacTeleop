@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deviceio_base/controller_tracker_base.hpp>
+#include <log_bridge/logger.hpp>
 #include <mcap/tracker_channels.hpp>
 #include <schema/controller_generated.h>
 
@@ -19,7 +20,9 @@ using ControllerMcapViewers = McapTrackerViewers<ControllerSnapshotRecord>;
 class ReplayControllerTrackerImpl : public IControllerTrackerImpl
 {
 public:
-    ReplayControllerTrackerImpl(std::unique_ptr<mcap::McapReader> reader, std::string_view base_name);
+    ReplayControllerTrackerImpl(std::unique_ptr<mcap::McapReader> reader,
+                                std::string_view base_name,
+                                const RecordedSchemas& recorded);
 
     ReplayControllerTrackerImpl(const ReplayControllerTrackerImpl&) = delete;
     ReplayControllerTrackerImpl& operator=(const ReplayControllerTrackerImpl&) = delete;
@@ -27,8 +30,8 @@ public:
     ReplayControllerTrackerImpl& operator=(ReplayControllerTrackerImpl&&) = delete;
 
     void update(int64_t monotonic_time_ns) override;
-    const ControllerSnapshotTrackedT& get_left_controller() const override;
-    const ControllerSnapshotTrackedT& get_right_controller() const override;
+    const Serialized<ControllerSnapshot>& get_left_controller() const override;
+    const Serialized<ControllerSnapshot>& get_right_controller() const override;
     // Replay sessions do not drive hardware — haptic feedback is a no-op here.
     void apply_left_haptic_feedback(float /*amplitude*/, float /*frequency_hz*/, float /*duration_s*/) const override
     {
@@ -38,9 +41,12 @@ public:
     }
 
 private:
-    ControllerSnapshotTrackedT left_tracked_;
-    ControllerSnapshotTrackedT right_tracked_;
+    Serialized<ControllerSnapshot> left_tracked_;
+    Serialized<ControllerSnapshot> right_tracked_;
     std::unique_ptr<ControllerMcapViewers> mcap_viewers_;
+    std::shared_ptr<spdlog::logger> logger_;
+    bool warned_no_left_data_ = false;
+    bool warned_no_right_data_ = false;
 };
 
 } // namespace core

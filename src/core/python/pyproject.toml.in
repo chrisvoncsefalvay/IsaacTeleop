@@ -9,16 +9,17 @@
 # See: numpy.org/devdocs/dev/depending_on_numpy.html
 
 [build-system]
-requires = ["setuptools>=64", "wheel", "numpy>=2.0"]
+requires = ["setuptools>=77", "wheel", "numpy>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "isaacteleop"
+name = "isaaccapture"
 version = "@ISAAC_TELEOP_PYPROJECT_VERSION@"
 description = "Isaac Teleop - Teleoperation with Device I/O"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE.md"]
 authors = [
     {name = "NVIDIA"}
 ]
@@ -31,46 +32,73 @@ optional-dependencies.ui = {file = ["requirements-ui.txt"]}
 optional-dependencies.retargeters = {file = ["requirements-retargeters.txt"]}
 optional-dependencies.retargeters-lite = {file = ["requirements-retargeters-lite.txt"]}
 optional-dependencies.grounding = {file = ["requirements-grounding.txt"]}
+optional-dependencies.wuji = {file = ["requirements-wuji.txt"]}
 optional-dependencies.cloudxr = {file = ["requirements-cloudxr.txt"]}
 
 [tool.setuptools]
-packages = [
-    "isaacteleop",
-    "isaacteleop.deviceio",
-    "isaacteleop.deviceio_trackers",
-    "isaacteleop.deviceio_session",
-    "isaacteleop.mcap",
-    "isaacteleop.oxr",
-    "isaacteleop.plugin_manager",
-    "isaacteleop.schema",
-    "isaacteleop.retargeting_engine",
-    "isaacteleop.retargeting_engine.interface",
-    "isaacteleop.retargeting_engine.tensor_types",
-    "isaacteleop.retargeting_engine.deviceio_source_nodes",
-    "isaacteleop.retargeting_engine.utilities",
-    "isaacteleop.retargeters",
-    "isaacteleop.retargeters.G1",
-    "isaacteleop.retargeters.SO101",
-    "isaacteleop.retargeters.joint_space",
-    "isaacteleop.retargeting_engine_ui",
-    "isaacteleop.teleop_session_manager",
-    "isaacteleop.cloudxr",
-    "isaacteleop.haptic_devices",
-@VIZ_PACKAGES_BLOCK@@ROBOTIC_GROUNDING_PACKAGES_BLOCK@]
 include-package-data = false
+py-modules = ["isaacteleop"]  # TODO(1.9): drop the compatibility module.
+
+# Packages are discovered from the staged tree: this file is generated into
+# python_package/<config>/, whose isaaccapture/ subtree CMake has already
+# assembled, so a package ships exactly when it was staged -- which is how
+# BUILD_VIZ selects its optional package.
+#
+# namespaces = false is load-bearing: pyproject.toml has no separate
+# find-namespace table and the default finder is the namespace one, so any staged
+# directory without an __init__.py would be taken for a package -- notably
+# isaaccapture/cloudxr/native/, which ships as package data of isaaccapture.cloudxr.
+#
+# include names the top-level packages explicitly, so files that sit in the
+# staging root (setuptools' own build/, *.egg-info) are never mistaken for one.
+# robotic_grounding is the curated retargeting package staged from public V2D.
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = false
+include = [
+    "isaaccapture",
+    "isaaccapture.*",
+    "robotic_grounding",
+    "robotic_grounding.retarget",
+]
 
 [tool.setuptools.package-data]
-isaacteleop = ["*.so", "*.pyd", "*.pyi", "py.typed"]
-"isaacteleop.deviceio" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.deviceio_trackers" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.deviceio_session" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.mcap" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.oxr" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.plugin_manager" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.schema" = ["*.so", "*.pyd", "*.pyi"]
-"isaacteleop.cloudxr" = ["native/*.so", "native/*.so.*", "native/openxr_cloudxr.json"]
-"isaacteleop.haptic_devices" = ["*.so", "*.pyd", "*.pyi"]
-@VIZ_PACKAGE_DATA_BLOCK@@ROBOTIC_GROUNDING_PACKAGE_DATA_BLOCK@
+# plugins/: device plugins bundled so wheel installs can start them (BUNDLED_PLUGINS_DIR); not packages.
+isaaccapture = ["*.so", "*.pyd", "*.pyi", "py.typed", "plugins/*/*"]
+"isaaccapture.deviceio" = ["*.so", "*.pyd", "*.pyi"]
+# CHROMIUM_LICENSE: the notice for the key table compiled into _deviceio_trackers.
+"isaaccapture.deviceio_trackers" = ["*.so", "*.pyd", "*.pyi", "CHROMIUM_LICENSE"]
+"isaaccapture.deviceio_session" = ["*.so", "*.pyd", "*.pyi"]
+"isaaccapture.mcap" = ["*.so", "*.pyd", "*.pyi"]
+"isaaccapture.oxr" = ["*.so", "*.pyd", "*.pyi"]
+"isaaccapture.plugin_manager" = ["*.so", "*.pyd", "*.pyi"]
+"isaaccapture.schema" = ["*.so", "*.pyd", "*.pyi"]
+"isaaccapture.cloudxr" = ["native/*.so", "native/*.so.*", "native/openxr_cloudxr.json"]
+# Matches nothing when ENABLE_CLOUDXR_EXP_BUNDLE=OFF (default ON) skipped staging
+# the experimental runtime; the package's two .py ship either way.
+"isaaccapture.cloudxr_exp" = ["native/*.so", "native/*.so.*", "native/openxr_cloudxr.json"]
+"isaaccapture.haptic_devices" = ["*.so", "*.pyd", "*.pyi"]
+# Keys for packages staged in only some configurations are inert in the rest:
+# package-data for a package `find` did not discover matches nothing.
+"isaaccapture.viz" = ["*.so", "*.pyd", "*.pyi"]
+# The robot twin's backend, plus the libisaacteleop_mujoco.so it loads. Not staged on
+# Windows, where the twin is not built. assets/ has no __init__.py, so its MJCF ships as
+# this package's data rather than as a package of its own.
+"isaaccapture.viz.robot" = [
+    "*.so",
+    "*.pyd",
+    "*.pyi",
+    "assets/*.xml",
+    "controller-guide-*.png",
+    "MUJOCO_LICENSE",
+]
+robotic_grounding = [
+    "V2D_LICENSE",
+    "assets/xmls/sharpawave/*.xml",
+    "assets/xmls/sharpawave/LICENSE",
+    "assets/xmls/sharpawave/NOTICE",
+    "assets/xmls/sharpawave/README.md",
+]
 
 [tool.uv]
 # Only use managed Python installations (not system Python)

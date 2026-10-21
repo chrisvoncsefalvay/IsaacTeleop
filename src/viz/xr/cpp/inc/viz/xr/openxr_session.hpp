@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <log_bridge/logger.hpp>
 #include <openxr/openxr.h>
 
 #include <chrono>
@@ -56,6 +57,11 @@ public:
                            const std::vector<std::string>& extra_extensions = {},
                            int system_wait_seconds = 0);
 
+    // Optional per-poll callback during wait_for_system. The Python binding
+    // uses it to raise KeyboardInterrupt; C++ callers leave it null.
+    // Returns the previous hook so nested installers can restore it.
+    static void (*set_wait_poll_hook(void (*fn)()))();
+
     ~OpenXrSession();
 
     OpenXrSession(const OpenXrSession&) = delete;
@@ -88,6 +94,17 @@ public:
     bool has_depth_composition_layer() const noexcept
     {
         return has_depth_composition_layer_;
+    }
+
+    // True iff the shaped composition-layer extension is enabled. Drives
+    // whether XrBackend accepts CylinderLayer / EquirectLayer.
+    bool has_cylinder_composition_layer() const noexcept
+    {
+        return has_cylinder_composition_layer_;
+    }
+    bool has_equirect2_composition_layer() const noexcept
+    {
+        return has_equirect2_composition_layer_;
     }
 
     // True iff XR_KHR_convert_timespec_time is enabled. When false the
@@ -161,6 +178,23 @@ public:
         return exit_requested_;
     }
 
+    // True once since the last call if the runtime moved the reference space's
+    // origin (recenter, guardian rebound). Consume-once: a pose LATCHED in the
+    // old space is silently wrong afterwards and its owner must re-anchor, so
+    // this must not be missed by a caller that polls it every frame.
+    bool take_reference_space_changed() noexcept
+    {
+        const bool changed = reference_space_changed_;
+        reference_space_changed_ = false;
+        return changed;
+    }
+
+    // Ends a running session the way the spec requires: xrRequestExitSession, then poll until the
+    // runtime reports STOPPING (poll_events() issues xrEndSession). Returns true once the session
+    // is no longer running, including when it never ran; false on a failed request or timeout.
+    // Idempotent; the destructor calls it. Same-thread rule as poll_events.
+    bool end_session(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
+
     // Throws on hard XR failures. XR_FRAME_DISCARDED on begin_frame is
     // non-fatal — pair with end_frame to keep the protocol balanced.
     bool wait_frame(XrFrameState* out_state);
@@ -199,6 +233,8 @@ private:
     InstanceHandle instance_{ nullptr, nullptr };
     XrSystemId system_id_ = XR_NULL_SYSTEM_ID;
     bool has_depth_composition_layer_ = false;
+    bool has_cylinder_composition_layer_ = false;
+    bool has_equirect2_composition_layer_ = false;
     bool has_time_conversion_ = false;
     // Type-erased so this header doesn't need XR_USE_TIMESPEC; .cpp casts back.
     PFN_xrVoidFunction xr_convert_timespec_time_to_time_ = nullptr;
@@ -215,6 +251,10 @@ private:
     XrSessionState state_ = XR_SESSION_STATE_UNKNOWN;
     bool session_running_ = false;
     bool exit_requested_ = false;
+    bool reference_space_changed_ = false;
+
+    // Declared last: no teardown-order relationship with the OpenXR handles above.
+    std::shared_ptr<spdlog::logger> logger_ = isaaccapture::Logger::get("isaaccapture.viz.OpenXrSession");
 };
 
 } // namespace viz

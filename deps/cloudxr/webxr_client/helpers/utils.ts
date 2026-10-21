@@ -48,12 +48,19 @@ export function enableLocalStorage(element: HTMLInputElement | HTMLSelectElement
     return;
   }
 
+  // Checkboxes persist via `.checked` (as 'true'/'false'), everything else via `.value`.
+  const isCheckbox = element instanceof HTMLInputElement && element.type === 'checkbox';
+
   // Load saved value from localStorage
   try {
     // Check if the key exists in localStorage, not just if it has values
     if (localStorage.hasOwnProperty(key)) {
       const savedValue = localStorage.getItem(key);
-      element.value = savedValue || '';
+      if (isCheckbox) {
+        (element as HTMLInputElement).checked = savedValue === 'true';
+      } else {
+        element.value = savedValue || '';
+      }
       console.info(`Loaded saved ${key} from localStorage:`, savedValue);
     }
   } catch (error) {
@@ -63,9 +70,9 @@ export function enableLocalStorage(element: HTMLInputElement | HTMLSelectElement
   // Set up event listener to save value when changed
   const changeHandler = () => {
     try {
-      // Always save the value, even if it's empty
-      localStorage.setItem(key, element.value);
-      console.info(`Saved ${key} to localStorage:`, JSON.stringify(element.value));
+      const toSave = isCheckbox ? String((element as HTMLInputElement).checked) : element.value;
+      localStorage.setItem(key, toSave);
+      console.info(`Saved ${key} to localStorage:`, JSON.stringify(toSave));
     } catch (error) {
       console.warn(`${key}: Failed to save to localStorage:`, error);
     }
@@ -187,6 +194,18 @@ export interface CloudXRConfig {
 
   /** Media server port for WebRTC streaming (use 0 for server-provided port) */
   mediaPort?: number;
+
+  /**
+   * Pre-stream network test: 'off' skips it, 'warn' measures and reports, 'block' also
+   * refuses to stream when the link fails the gate.
+   *
+   * Defaults to 'off' for IsaacTeleop. The test holds the session in Connecting for its
+   * whole window, and an operator connecting to a robot should not be gated on it.
+   */
+  streamTestMode?: 'off' | 'warn' | 'block';
+
+  /** Length of the network test measurement window in seconds. Ignored when the test is off. */
+  streamTestDurationSeconds?: number;
 }
 
 /**

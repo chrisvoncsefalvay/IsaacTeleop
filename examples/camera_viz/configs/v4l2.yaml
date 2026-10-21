@@ -9,7 +9,9 @@
 # Defaults match the ZED Mini's UVC HD720 side-by-side mode at
 # /dev/video0 (2560x720 YUYV @ 30fps; cv2 negotiates YUYV→BGR on CPU,
 # GPU then channel-swaps BGR→RGBA). For a regular UVC webcam, edit
-# device/width/height/fps per ``v4l2-ctl --list-formats-ext``.
+# device/width/height/fps per ``v4l2-ctl --list-formats-ext``. A camera
+# that lacks this mode fails to open ("requested 2560x720, got 640x480"),
+# so use the config that matches the camera: realsense.yaml for a RealSense.
 
 source: local                   # local | rtp
 streaming:
@@ -32,15 +34,19 @@ cameras:
       # gop:                    # default: fps*5 (IDR every 5 s, ULL tuning)
 
 display:
-  mode: window                  # window | xr
+  mode: xr                      # xr | window (xr is the default)
   window:
     width: 2560
     height: 720
   xr:
     near_z: 0.05
     far_z: 100.0
+    # How long create() waits for the headset to connect. -1 (default) waits
+    # forever, so you can start the viewer before putting the Quest on; 0
+    # fails fast.
+    system_wait_seconds: -1
   clear_color: [0.0, 0.0, 0.0, 0.0]
   placements:
     cam:                        # size defaults to 1.0 m wide × aspect-derived height
       lock_mode: lazy
-      distance: 1.5
+      distance: 1.0

@@ -45,9 +45,9 @@ import mujoco.viewer
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-import isaacteleop.deviceio as deviceio
-import isaacteleop.oxr as oxr
-from isaacteleop.cloudxr import CloudXRLauncher
+import isaaccapture.deviceio as deviceio
+import isaaccapture.oxr as oxr
+from isaaccapture.cloudxr import CloudXRLauncher
 
 
 # Route MuJoCo warnings to stderr instead of writing MUJOCO_LOG.TXT in CWD.
@@ -266,7 +266,7 @@ def main() -> int:
                 while viewer.is_running():
                     session.update()
 
-                    head = head_tracker.get_head(session).data
+                    head = head_tracker.get_head(session)
                     if head is not None and head.is_valid:
                         pos, quat = _convert_pose(
                             head.pose.position, head.pose.orientation
@@ -281,7 +281,7 @@ def main() -> int:
                         ("controller_left", controller_tracker.get_left_controller),
                         ("controller_right", controller_tracker.get_right_controller),
                     ):
-                        ctrl = getter(session).data
+                        ctrl = getter(session)
                         if ctrl is None:
                             continue
                         cpose = ctrl.aim_pose if args.pose == "aim" else ctrl.grip_pose

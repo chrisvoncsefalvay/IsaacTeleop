@@ -37,15 +37,19 @@ cameras:
       # gop:                    # default: fps*5 (IDR every 5 s, ULL tuning)
 
 display:
-  mode: window                  # window | xr
+  mode: xr                      # xr | window (xr is the default)
   window:
     width: 1920
     height: 1080
   xr:
     near_z: 0.05
     far_z: 100.0
+    # How long create() waits for the headset to connect. -1 (default) waits
+    # forever, so you can start the viewer before putting the Quest on; 0
+    # fails fast.
+    system_wait_seconds: -1
   clear_color: [0.0, 0.0, 0.0, 0.0]
   placements:
     cam:                        # size defaults to 1.0 m wide × aspect-derived height
       lock_mode: lazy
-      distance: 1.5
+      distance: 1.0

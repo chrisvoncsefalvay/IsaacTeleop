@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -16,9 +16,9 @@ Test sequence:
 import time
 from pathlib import Path
 
-import isaacteleop.deviceio as deviceio
-import isaacteleop.oxr as oxr
-import isaacteleop.plugin_manager as pm
+import isaaccapture.deviceio as deviceio
+import isaaccapture.oxr as oxr
+import isaaccapture.plugin_manager as pm
 
 PLUGIN_ROOT_DIR = Path(__file__).resolve().parent.parent.parent.parent / "plugins"
 
@@ -32,7 +32,7 @@ def poll_hands(hand_tracker, deviceio_session):
     deviceio_session.update()
     left = hand_tracker.get_left_hand(deviceio_session)
     right = hand_tracker.get_right_hand(deviceio_session)
-    return left.data is not None, right.data is not None
+    return left is not None, right is not None
 
 
 def run_test():

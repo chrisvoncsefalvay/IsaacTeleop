@@ -9,7 +9,6 @@
 #include <viz/core/openxr_platform_compat.hpp>
 
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -21,6 +20,9 @@ namespace viz
 namespace
 {
 
+// Per creating thread; set by VizSession.create while wait_for_system runs.
+thread_local void (*g_wait_poll_hook)() = nullptr;
+
 void check_xr(XrResult r, const char* what)
 {
     if (XR_FAILED(r))
@@ -30,6 +32,13 @@ void check_xr(XrResult r, const char* what)
 }
 
 } // namespace
+
+void (*OpenXrSession::set_wait_poll_hook(void (*fn)()))()
+{
+    void (*prev)() = g_wait_poll_hook;
+    g_wait_poll_hook = fn;
+    return prev;
+}
 
 OpenXrSession::OpenXrSession(const std::string& app_name,
                              const std::vector<std::string>& extra_extensions,
@@ -41,16 +50,50 @@ OpenXrSession::OpenXrSession(const std::string& app_name,
 
 OpenXrSession::~OpenXrSession()
 {
-    // Explicit xrEndSession before unique_ptr's xrDestroySession.
-    // Best-effort — dtor can't throw.
-    if (session_ && session_running_)
+    // End the session before unique_ptr's xrDestroySession. Best-effort — dtor can't throw.
+    try
     {
-        (void)xrEndSession(session_.get());
-        session_running_ = false;
+        end_session();
+    }
+    catch (const std::exception& e)
+    {
+        logger_->warn("end_session failed during teardown: {}", e.what());
     }
     // Member destruction order is reverse declaration: view_space →
     // reference_space → session → instance. Each unique_ptr's deleter
     // runs xrDestroy* in the right order.
+}
+
+bool OpenXrSession::end_session(std::chrono::milliseconds timeout)
+{
+    if (!session_ || !session_running_)
+    {
+        return true;
+    }
+    // xrEndSession is only valid in STOPPING, which the runtime enters after an exit request;
+    // poll_events() then ends the session from its STOPPING handler.
+    const XrResult r = xrRequestExitSession(session_.get());
+    if (XR_FAILED(r))
+    {
+        logger_->warn("xrRequestExitSession failed: XrResult={}", static_cast<int>(r));
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true)
+    {
+        poll_events();
+        if (!session_running_)
+        {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            logger_->warn("runtime did not report STOPPING within {} ms; destroying the session anyway",
+                          static_cast<long long>(timeout.count()));
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 }
 
 void OpenXrSession::create_instance(const std::string& app_name, const std::vector<std::string>& extra_extensions)
@@ -76,6 +119,8 @@ void OpenXrSession::create_instance(const std::string& app_name, const std::vect
     }
     const bool runtime_has_depth_layer = available_exts.count(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) > 0;
     const bool runtime_has_time_conversion = available_exts.count(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME) > 0;
+    const bool runtime_has_cylinder_layer = available_exts.count(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) > 0;
+    const bool runtime_has_equirect2_layer = available_exts.count(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME) > 0;
 
     // Build the request list deduped: required → opt-in → caller extras.
     // Caller extras are validated; passing an unsupported one is fatal.
@@ -96,6 +141,17 @@ void OpenXrSession::create_instance(const std::string& app_name, const std::vect
     if (runtime_has_time_conversion)
     {
         add_unique(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
+    }
+    // Shaped composition layers (CylinderLayer / EquirectLayer). Opt-in
+    // when advertised; layers requiring them are rejected at add_layer
+    // when the runtime lacks the extension.
+    if (runtime_has_cylinder_layer)
+    {
+        add_unique(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    }
+    if (runtime_has_equirect2_layer)
+    {
+        add_unique(XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME);
     }
     for (const auto& e : extra_extensions)
     {
@@ -118,6 +174,8 @@ void OpenXrSession::create_instance(const std::string& app_name, const std::vect
     check_xr(xrCreateInstance(&info, &raw_instance), "xrCreateInstance");
     instance_ = InstanceHandle(raw_instance, &xrDestroyInstance);
     has_depth_composition_layer_ = runtime_has_depth_layer;
+    has_cylinder_composition_layer_ = runtime_has_cylinder_layer;
+    has_equirect2_composition_layer_ = runtime_has_equirect2_layer;
 
     // Resolve PFNs only if both succeed — leave the feature off rather
     // than half-working.
@@ -157,7 +215,7 @@ void OpenXrSession::wait_for_system(int system_wait_seconds)
         {
             if (announced)
             {
-                std::fprintf(stderr, "OpenXrSession: HMD connected.\n");
+                logger_->info("HMD connected.");
             }
             return;
         }
@@ -170,24 +228,30 @@ void OpenXrSession::wait_for_system(int system_wait_seconds)
         {
             throw std::runtime_error(
                 "OpenXrSession: xrGetSystem timed out waiting for HMD "
-                "(XR_ERROR_FORM_FACTOR_UNAVAILABLE) after " +
-                std::to_string(system_wait_seconds) + "s");
+                "(XR_ERROR_FORM_FACTOR_UNAVAILABLE, -35) after " +
+                std::to_string(system_wait_seconds) +
+                "s. The OpenXR runtime is up but no headset is connected to it. "
+                "Connect the headset, check NV_DEVICE_PROFILE matches it, or raise "
+                "xr_system_wait_seconds to block until it connects. "
+                "See docs/source/references/cloudxr.rst, Troubleshooting.");
         }
         if (!announced || (now - last_log) >= kLogEvery)
         {
             if (wait_forever)
             {
-                std::fprintf(stderr, "OpenXrSession: waiting for HMD to connect...\n");
+                logger_->info("waiting for HMD to connect...");
             }
             else
             {
                 const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count();
-                std::fprintf(stderr, "OpenXrSession: waiting for HMD to connect (%llds remaining)...\n",
-                             static_cast<long long>(remaining));
+                logger_->info("waiting for HMD to connect ({}s remaining)...", static_cast<long long>(remaining));
             }
-            std::fflush(stderr);
             announced = true;
             last_log = now;
+        }
+        if (g_wait_poll_hook != nullptr)
+        {
+            g_wait_poll_hook();
         }
         std::this_thread::sleep_for(kPollInterval);
     }
@@ -267,7 +331,7 @@ void OpenXrSession::enumerate_environment_blend_mode()
     default:
         break;
     }
-    std::fprintf(stderr, "OpenXrSession: env blend mode = %s\n", mode_str);
+    logger_->info("env blend mode = {}", mode_str);
 }
 
 void OpenXrSession::create_session(const VkContext& vk)
@@ -380,9 +444,11 @@ void OpenXrSession::poll_events()
             exit_requested_ = true;
             break;
         case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-            // Pose origin shifted (recenter, guardian rebound). For
-            // seated/local the next locate_views absorbs the change;
-            // app can re-anchor world-locked content if it cares.
+            // Pose origin shifted (recenter, guardian rebound). locate_views
+            // absorbs it, but a pose the app LATCHED in the old space does not:
+            // it is now wrong by the whole recenter transform. Surfaced through
+            // FrameInfo::reference_space_changed so the owner can re-anchor.
+            reference_space_changed_ = true;
             break;
         default:
             // Ignore unknown / extension event types we didn't ask for.
@@ -411,8 +477,7 @@ void OpenXrSession::handle_session_state_change(XrSessionState new_state)
             // silently spin nullopt frames forever. Surface it as
             // exit_requested_; throwing from poll_events would unbalance
             // begin_frame's protocol guard.
-            std::fprintf(
-                stderr, "OpenXrSession: xrBeginSession failed: XrResult=%d (requesting exit)\n", static_cast<int>(r));
+            logger_->error("xrBeginSession failed: XrResult={} (requesting exit)", static_cast<int>(r));
             exit_requested_ = true;
         }
         break;
@@ -426,7 +491,11 @@ void OpenXrSession::handle_session_state_change(XrSessionState new_state)
     case XR_SESSION_STATE_STOPPING:
         if (session_running_)
         {
-            (void)xrEndSession(session_.get());
+            const XrResult r = xrEndSession(session_.get());
+            if (XR_FAILED(r))
+            {
+                logger_->warn("xrEndSession failed: XrResult={}", static_cast<int>(r));
+            }
             session_running_ = false;
         }
         break;

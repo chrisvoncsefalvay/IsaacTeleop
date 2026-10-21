@@ -4,7 +4,6 @@
 #pragma once
 
 #include <array>
-#include <string_view>
 
 namespace core
 {
@@ -12,62 +11,55 @@ namespace core
 /**
  * @brief Compile-time MCAP recording metadata per tracker type.
  *
- * Centralizes schema names and default channel names used for MCAP recording
- * and replay. Each tracker impl's create_mcap_channels references these
- * instead of embedding string literals.
+ * Centralizes the default channel names used for MCAP recording and replay. Each tracker
+ * impl's create_mcap_channels references these instead of embedding string literals. The
+ * schema name is not here: flatc derives it from the .fbs as RecordT::GetFullyQualifiedName(),
+ * which is what both McapTrackerChannels and McapTrackerViewers use.
  */
 
 struct HeadRecordingTraits
 {
-    static constexpr std::string_view schema_name = "core.HeadPoseRecord";
     static constexpr std::array recording_channels = { "head" };
     static constexpr std::array replay_channels = { "head" };
 };
 
 struct HandRecordingTraits
 {
-    static constexpr std::string_view schema_name = "core.HandPoseRecord";
     static constexpr std::array recording_channels = { "left_hand", "right_hand" };
     static constexpr std::array replay_channels = { "left_hand", "right_hand" };
 };
 
 struct ControllerRecordingTraits
 {
-    static constexpr std::string_view schema_name = "core.ControllerSnapshotRecord";
     static constexpr std::array recording_channels = { "left_controller", "right_controller" };
     static constexpr std::array replay_channels = { "left_controller", "right_controller" };
 };
 
-struct FullBodyPicoRecordingTraits
+struct FullBodyRecordingTraits
 {
-    static constexpr std::string_view schema_name = "core.FullBodyPosePicoRecord";
     static constexpr std::array recording_channels = { "full_body" };
     static constexpr std::array replay_channels = { "full_body" };
 };
 
-struct PedalRecordingTraits
-{
-    static constexpr std::string_view schema_name = "core.Generic3AxisPedalOutputRecord";
-    static constexpr std::array recording_channels = { "pedals", "pedals_tracked" };
-    static constexpr std::array replay_channels = { "pedals_tracked" };
-};
-
-struct JointStateRecordingTraits
-{
-    static constexpr std::string_view schema_name = "core.JointStateOutputRecord";
-    static constexpr std::array recording_channels = { "joint_state", "joint_state_tracked" };
-    static constexpr std::array replay_channels = { "joint_state_tracked" };
-};
-
-struct OakRecordingTraits
-{
-    static constexpr std::string_view schema_name = "core.FrameMetadataOakRecord";
-};
+// Deprecated alias for the renamed FullBodyRecordingTraits (was
+// FullBodyPicoRecordingTraits before the vendor-agnostic rename). Retained so source
+// referencing the old type name keeps compiling (with a deprecation warning); prefer
+// FullBodyRecordingTraits.
+using FullBodyPicoRecordingTraits [[deprecated("renamed to core::FullBodyRecordingTraits")]] = FullBodyRecordingTraits;
 
 struct MessageChannelRecordingTraits
 {
-    static constexpr std::string_view schema_name = "core.MessageChannelMessagesRecord";
     static constexpr std::array channels = { "message_channel" };
 };
+
+struct KeyboardRecordingTraits
+{
+    static constexpr std::array recording_channels = { "keyboard" };
+    static constexpr std::array replay_channels = { "keyboard" };
+};
+
+// Traits for trackers declared in deviceio_trackers/trackers.toml, emitted from their
+// channel manifest key. Add traits above by hand only for hand-written trackers.
+#include "generated_recording_traits.inc"
 
 } // namespace core

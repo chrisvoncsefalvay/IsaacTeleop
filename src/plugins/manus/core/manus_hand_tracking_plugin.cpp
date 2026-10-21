@@ -1,15 +1,35 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+// Bridges MANUS Core (integrated mode) to the IsaacTeleop DeviceIO layer for a
+// pair of MANUS gloves.
+//
+// MANUS SDK callbacks fire on SDK threads and only cache state: skeleton joints,
+// the glove ids discovered from the landscape, and raw flex-sensor transforms.
+// All consumption happens on the plugin tick in update(), which drives three
+// independently switchable datasets (see ManusPluginConfig):
+//   human   - cached joints are anchored to a wrist pose from the OpenXR xdev
+//             hand trackers, or a controller aim pose when xdev is unavailable,
+//             and injected as XR_EXT_hand_tracking joints.
+//   sensors - cached sensor transforms are pushed as JointSe3PoseOutput flatbuffers.
+//   haptic  - inbound HapticCommands are forwarded to the glove finger motors.
+//
+// ManusTracker is a singleton because the SDK's C callbacks carry no user
+// pointer and must reach the instance through instance().
+
 #include "inc/manus/manus_hand_tracking_plugin.hpp"
 
 #include "inc/manus/manus_glove_collection.hpp"
 
+#include <flatbuffers/flatbuffers.h>
 #include <oxr/oxr_session.hpp>
 #include <oxr_utils/math.hpp>
+#include <oxr_utils/os_time.hpp>
 #include <oxr_utils/pose_conversions.hpp>
 #include <plugin_utils/hand_injector.hpp>
+#include <pusherio/schema_pusher.hpp>
 #include <schema/haptic_command_generated.h>
+#include <schema/joint_se3_pose_generated.h>
 
 #include <ManusSDK.h>
 #include <ManusSDKTypeInitializers.h>
@@ -17,10 +37,13 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <iostream>
+#include <cstdint>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -54,12 +77,50 @@ bool is_openxr_extension_supported(const char* ext_name)
 
 SDKReturnCode get_raw_skeleton_node_count(uint32_t glove_id, uint32_t& node_count)
 {
-#if defined(__aarch64__) || defined(__arm__) || defined(_M_ARM64) || defined(_M_ARM)
-    // Manus SDK 3.1.1 ships different declarations for this call across architectures.
     return CoreSdk_GetRawSkeletonNodeCount(glove_id, &node_count);
-#else
-    return CoreSdk_GetRawSkeletonNodeCount(glove_id, node_count);
-#endif
+}
+
+// Must agree with JointSe3PoseTracker::DEFAULT_MAX_FLATBUFFER_SIZE on the consumer side
+// (src/core/deviceio_trackers/trackers.toml).
+constexpr size_t kSensorFlatbufferSize = 1024;
+constexpr auto kSkeletonStaleThreshold = std::chrono::milliseconds(200);
+// MANUS supplies 25 nodes. Injection expands them to OpenXR's 26 joints by
+// deriving the palm from the final MANUS node.
+constexpr size_t kMinimumUsableSkeletonNodes = static_cast<size_t>(XR_HAND_JOINT_COUNT_EXT) - 1;
+
+int64_t steady_now_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool has_current_usable_skeleton(const std::vector<SkeletonNode>& nodes,
+                                 std::chrono::steady_clock::time_point stamp,
+                                 std::chrono::steady_clock::time_point now)
+{
+    return nodes.size() >= kMinimumUsableSkeletonNodes && now - stamp <= kSkeletonStaleThreshold;
+}
+
+std::vector<unsigned char> read_calibration_file(const std::string& path)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file)
+    {
+        throw std::runtime_error("Failed to open Manus calibration file: " + path);
+    }
+
+    const std::streamsize size = file.tellg();
+    if (size <= 0 || static_cast<uint64_t>(size) > std::numeric_limits<uint32_t>::max())
+    {
+        throw std::runtime_error("Invalid Manus calibration file size: " + path);
+    }
+
+    std::vector<unsigned char> data(static_cast<size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(data.data()), size))
+    {
+        throw std::runtime_error("Failed to read Manus calibration file: " + path);
+    }
+    return data;
 }
 
 } // anonymous namespace
@@ -67,9 +128,9 @@ SDKReturnCode get_raw_skeleton_node_count(uint32_t glove_id, uint32_t& node_coun
 static constexpr XrPosef kLeftHandOffset = { { -0.70710678f, -0.5f, 0.0f, 0.5f }, { -0.1f, 0.02f, -0.02f } };
 static constexpr XrPosef kRightHandOffset = { { -0.70710678f, 0.5f, 0.0f, 0.5f }, { 0.1f, 0.02f, -0.02f } };
 
-ManusTracker& ManusTracker::instance(const std::string& app_name) noexcept(false)
+ManusTracker& ManusTracker::instance(const ManusPluginConfig& config) noexcept(false)
 {
-    static ManusTracker s(app_name);
+    static ManusTracker s(config);
     return s;
 }
 
@@ -77,34 +138,67 @@ void ManusTracker::update()
 {
     if (!m_deviceio_session)
     {
-        // OpenXR unavailable — nothing to update for positioning/injection
+        // OpenXR unavailable — nothing to update for positioning/injection/push
         return;
     }
 
     // Update DeviceIOSession which handles time conversion and tracker updates internally
     m_deviceio_session->update();
-
-    // Latest-wins: the hardware only retains the most recent vibration call,
-    // so dropping intermediate samples on a slow tick is fine. The generic
-    // HapticCommand carries an endpoint string ("left"/"right"); commands for
-    // other endpoints or with a non-5-finger values vector are ignored (this
-    // plugin only drives 5-finger gloves).
-    if (m_haptic_reader)
+    try
     {
-        const auto& tracked = m_haptic_reader->get_data(*m_deviceio_session);
-        if (tracked.data && tracked.data->values.size() == kManusFingerCount &&
-            (tracked.data->endpoint == "left" || tracked.data->endpoint == "right"))
+        publish_device_status();
+        m_status_publish_error_logged = false;
+    }
+    catch (const std::exception& error)
+    {
+        if (!m_status_publish_error_logged)
         {
-            std::array<float, kManusFingerCount> powers{};
-            for (size_t i = 0; i < kManusFingerCount; ++i)
-            {
-                powers[i] = tracked.data->values[i];
-            }
-            apply_haptic_command(tracked.data->endpoint == "left", powers);
+            m_logger->warn("Device status publishing failed; tracking will continue: {}", error.what());
+            m_status_publish_error_logged = true;
+        }
+    }
+    catch (...)
+    {
+        if (!m_status_publish_error_logged)
+        {
+            m_logger->warn("Device status publishing failed; tracking will continue.");
+            m_status_publish_error_logged = true;
         }
     }
 
-    inject_hand_data();
+    // Latest-wins per endpoint: the hardware only retains the most recent
+    // vibration call, so dropping intermediate samples on a slow tick is fine.
+    // The producer pushes an independent HapticCommand per hand on one
+    // collection, so read each side separately -- reading a single latest sample
+    // would let whichever hand was pushed last clobber the other. Non-5-finger
+    // payloads are ignored (this plugin only drives 5-finger gloves).
+    if (m_haptic_reader)
+    {
+        for (const std::string_view endpoint : { std::string_view("left"), std::string_view("right") })
+        {
+            const auto& tracked = m_haptic_reader->get_data(*m_deviceio_session, endpoint);
+            const core::HapticCommand* command = tracked.get();
+            if (command != nullptr && command->values() != nullptr && command->values()->size() == kManusFingerCount)
+            {
+                std::array<float, kManusFingerCount> powers{};
+                for (size_t i = 0; i < kManusFingerCount; ++i)
+                {
+                    powers[i] = command->values()->Get(i);
+                }
+                apply_haptic_command(endpoint == "left", powers);
+            }
+        }
+    }
+
+    if (m_config.sensors)
+    {
+        push_sensor_states();
+    }
+
+    if (m_config.human)
+    {
+        inject_hand_data();
+    }
 }
 
 std::vector<SkeletonNode> ManusTracker::get_left_hand_nodes() const
@@ -166,16 +260,17 @@ void ManusTracker::apply_haptic_command(bool is_left, const std::array<float, kM
         bool expected = false;
         if (m_haptic_error_logged[slot].compare_exchange_strong(expected, true))
         {
-            std::cerr << "[Manus] CoreSdk_VibrateFingersForGlove failed for " << (is_left ? "left" : "right")
-                      << " glove (id=" << glove_id << ", code=" << static_cast<int>(rc)
-                      << "); further errors for this side will be silenced." << std::endl;
+            m_logger->warn(
+                "CoreSdk_VibrateFingersForGlove failed for {} glove (id={}, code={}); further errors for "
+                "this side will be silenced.",
+                is_left ? "left" : "right", glove_id, static_cast<int>(rc));
         }
     }
 }
 
-ManusTracker::ManusTracker(const std::string& app_name) noexcept(false)
+ManusTracker::ManusTracker(const ManusPluginConfig& config) noexcept(false) : m_config(config)
 {
-    initialize(app_name);
+    initialize();
 }
 
 ManusTracker::~ManusTracker()
@@ -192,16 +287,36 @@ ManusTracker::~ManusTracker()
     shutdown_sdk();
 }
 
-void ManusTracker::initialize(const std::string& app_name) noexcept(false)
+void ManusTracker::initialize() noexcept(false)
 {
-    std::cout << "[Manus] Initializing SDK..." << std::endl;
+    if (m_config.monitoring_plugin_root_id && m_config.monitoring_plugin_root_id->empty())
+    {
+        throw std::invalid_argument("ManusTracker monitoring_plugin_root_id must not be empty");
+    }
+
+    if (!m_config.left_calibration_file.empty())
+    {
+        m_left_calibration_file = read_calibration_file(m_config.left_calibration_file);
+    }
+    if (!m_config.right_calibration_file.empty())
+    {
+        m_right_calibration_file = read_calibration_file(m_config.right_calibration_file);
+    }
+
+    // Registered before CoreSdk_InitializeIntegrated() so SDK-internal messages emitted
+    // during init itself (not just the ones our own wrapper narrates below) are captured too.
+    CoreSdk_RegisterCallbackForOnLog(OnLog);
+
+    m_logger->info("Initializing SDK...");
     const SDKReturnCode t_InitializeResult = CoreSdk_InitializeIntegrated();
     if (t_InitializeResult != SDKReturnCode::SDKReturnCode_Success)
     {
         throw std::runtime_error("Failed to initialize Manus SDK, error code: " +
                                  std::to_string(static_cast<int>(t_InitializeResult)));
     }
-    std::cout << "[Manus] SDK initialized successfully" << std::endl;
+    m_logger->info("SDK initialized successfully");
+    m_logger->info("datasets: human={} sensors={} haptic={}", m_config.human ? "on" : "off",
+                   m_config.sensors ? "on" : "off", m_config.haptic ? "on" : "off");
 
     RegisterCallbacks();
 
@@ -212,7 +327,7 @@ void ManusTracker::initialize(const std::string& app_name) noexcept(false)
     t_VUH.view = AxisView::AxisView_ZToViewer;
     t_VUH.unitScale = 1.0f;
 
-    std::cout << "[Manus] Setting up coordinate system (Y-up, right-handed, meters)..." << std::endl;
+    m_logger->info("Setting up coordinate system (Y-up, right-handed, meters)...");
     const SDKReturnCode t_CoordinateResult = CoreSdk_InitializeCoordinateSystemWithVUH(t_VUH, true);
 
     if (t_CoordinateResult != SDKReturnCode::SDKReturnCode_Success)
@@ -220,77 +335,159 @@ void ManusTracker::initialize(const std::string& app_name) noexcept(false)
         throw std::runtime_error("Failed to initialize Manus SDK coordinate system, error code: " +
                                  std::to_string(static_cast<int>(t_CoordinateResult)));
     }
-    std::cout << "[Manus] Coordinate system initialized successfully" << std::endl;
+    m_logger->info("Coordinate system initialized successfully");
 
     ConnectToGloves();
+
+    const bool monitoring_enabled = m_config.monitoring_plugin_root_id.has_value();
+    const bool needs_openxr = m_config.human || m_config.sensors || m_config.haptic || monitoring_enabled;
+    if (!needs_openxr)
+    {
+        m_logger->info("No OpenXR datasets enabled; running Manus-only (skeleton callbacks only).");
+        std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
+        m_initialized = true;
+        return;
+    }
 
     std::string error_msg = "Unknown error";
     bool success = false;
 
     try
     {
-        // Create ControllerTracker unconditionally; HandTracker requires
-        // XR_EXT_hand_tracking which is optional — only add it when the runtime
-        // advertises support so xrCreateInstance does not fail with
-        // XR_ERROR_EXTENSION_NOT_PRESENT on runtimes that lack the extension.
-        m_controller_tracker = std::make_shared<core::ControllerTracker>();
-        std::vector<std::shared_ptr<core::ITracker>> trackers = { m_controller_tracker };
+        std::vector<std::shared_ptr<core::ITracker>> trackers;
 
-        const bool hand_tracking_supported = is_openxr_extension_supported(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-        if (hand_tracking_supported)
+        if (m_config.human)
         {
-            m_hand_tracker = std::make_shared<core::HandTracker>();
-            trackers.push_back(m_hand_tracker);
+            // Create ControllerTracker unconditionally; HandTracker requires
+            // XR_EXT_hand_tracking which is optional — only add it when the runtime
+            // advertises support so xrCreateInstance does not fail with
+            // XR_ERROR_EXTENSION_NOT_PRESENT on runtimes that lack the extension.
+            m_controller_tracker = std::make_shared<core::ControllerTracker>();
+            trackers.push_back(m_controller_tracker);
+
+            const bool hand_tracking_supported = is_openxr_extension_supported(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+            if (hand_tracking_supported)
+            {
+                m_hand_tracker = std::make_shared<core::HandTracker>();
+                trackers.push_back(m_hand_tracker);
+            }
+            else
+            {
+                m_logger->info("{} is not supported by the current runtime; HandTracker will not be created.",
+                               XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+            }
         }
-        else
+
+        if (m_config.haptic)
         {
-            std::cout << "[Manus] " << XR_EXT_HAND_TRACKING_EXTENSION_NAME
-                      << " is not supported by the current runtime; HandTracker will not be created." << std::endl;
+            // Registering the reader pulls XR_NVX1_tensor_data into the
+            // OpenXRSession's required-extension set; the session will fail
+            // loudly on a runtime that doesn't advertise it. The reader's buffer
+            // must be >= the producer's collection sample size; we use the shared
+            // default (matching the producer's PushTensorHapticDevice) rather than
+            // a Manus-specific size that could drift below it.
+            m_haptic_reader = std::make_shared<core::HapticCommandReaderTracker>(MANUS_GLOVE_COLLECTION_ID);
+            trackers.push_back(m_haptic_reader);
         }
 
-        // Registering the reader pulls XR_NVX1_tensor_data into the
-        // OpenXRSession's required-extension set; the session will fail
-        // loudly on a runtime that doesn't advertise it. The reader's buffer
-        // must be >= the producer's collection sample size; we use the shared
-        // default (matching the producer's PushTensorHapticDevice) rather than
-        // a Manus-specific size that could drift below it.
-        m_haptic_reader = std::make_shared<core::HapticCommandReaderTracker>(MANUS_GLOVE_COLLECTION_ID);
-        trackers.push_back(m_haptic_reader);
+        std::vector<std::string> extensions;
+        if (!trackers.empty())
+        {
+            extensions = core::DeviceIOSession::get_required_extensions(trackers);
+        }
 
-        // Get required extensions from trackers
-        auto extensions = core::DeviceIOSession::get_required_extensions(trackers);
-        extensions.push_back(XR_NVX1_DEVICE_INTERFACE_BASE_EXTENSION_NAME);
+        if (m_config.sensors)
+        {
+            for (const auto& ext : core::SchemaPusher::get_required_extensions())
+            {
+                if (std::find(extensions.begin(), extensions.end(), ext) == extensions.end())
+                {
+                    extensions.push_back(ext);
+                }
+            }
+        }
+
+        if (monitoring_enabled)
+        {
+            for (const auto& ext : plugin_utils::PluginDeviceStatusPublisher::get_required_extensions())
+            {
+                if (std::find(extensions.begin(), extensions.end(), ext) == extensions.end())
+                {
+                    extensions.push_back(ext);
+                }
+            }
+        }
+
+        if (m_config.human)
+        {
+            extensions.push_back(XR_NVX1_DEVICE_INTERFACE_BASE_EXTENSION_NAME);
+        }
 
         // XR_MNDX_XDEV_SPACE_EXTENSION_NAME is optional: it enables optical (HMD) hand
         // tracking as a higher-quality wrist source. If the runtime does not advertise
         // it we fall back to controller-based tracking instead of crashing.
-        const bool xdev_extension_supported = is_openxr_extension_supported(XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
-        if (xdev_extension_supported)
+        bool xdev_extension_supported = false;
+        if (m_config.human)
         {
-            extensions.push_back(XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
-        }
-        else
-        {
-            std::cout << "[Manus] " << XR_MNDX_XDEV_SPACE_EXTENSION_NAME
-                      << " is not supported by the current runtime; optical hand tracking"
-                      << " will not be available and controller fallback will be used." << std::endl;
+            xdev_extension_supported = is_openxr_extension_supported(XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
+            if (xdev_extension_supported)
+            {
+                extensions.push_back(XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
+            }
+            else
+            {
+                m_logger->info(
+                    "{} is not supported by the current runtime; optical hand tracking will not be "
+                    "available and controller fallback will be used.",
+                    XR_MNDX_XDEV_SPACE_EXTENSION_NAME);
+            }
         }
 
         // Create session with required extensions - constructor automatically begins the session
-        const bool wait_for_openxr_system = true;
-        m_session = std::make_shared<core::OpenXRSession>(app_name, extensions, wait_for_openxr_system);
+        m_session = std::make_shared<core::OpenXRSession>(m_config.app_name, extensions);
         m_handles = m_session->get_handles();
+        if (monitoring_enabled)
+        {
+            m_status_publisher = std::make_unique<plugin_utils::PluginDeviceStatusPublisher>(
+                m_handles, *m_config.monitoring_plugin_root_id);
+        }
 
         // Initialize time converter now that handles are ready
         m_time_converter.emplace(m_handles);
 
-        // Initialize hand injectors (one per hand)
-        m_left_injector = std::make_unique<plugin_utils::HandInjector>(
-            m_handles.instance, m_handles.session, XR_HAND_LEFT_EXT, m_handles.space);
-        m_right_injector = std::make_unique<plugin_utils::HandInjector>(
-            m_handles.instance, m_handles.session, XR_HAND_RIGHT_EXT, m_handles.space);
+        if (m_config.human)
+        {
+            m_left_injector = std::make_unique<plugin_utils::HandInjector>(
+                m_handles.instance, m_handles.session, XR_HAND_LEFT_EXT, m_handles.space);
+            m_right_injector = std::make_unique<plugin_utils::HandInjector>(
+                m_handles.instance, m_handles.session, XR_HAND_RIGHT_EXT, m_handles.space);
+        }
 
-        m_deviceio_session = core::DeviceIOSession::run(trackers, m_handles);
+        if (m_config.sensors)
+        {
+            m_left_sensor_pusher = std::make_unique<core::SchemaPusher>(
+                m_handles, core::SchemaPusherConfig{ .collection_id = MANUS_SENSORS_LEFT_COLLECTION_ID,
+                                                     .max_flatbuffer_size = kSensorFlatbufferSize,
+                                                     .tensor_identifier = "joint_se3_pose",
+                                                     .localized_name = "Manus Sensors Left",
+                                                     .app_name = m_config.app_name });
+            m_right_sensor_pusher = std::make_unique<core::SchemaPusher>(
+                m_handles, core::SchemaPusherConfig{ .collection_id = MANUS_SENSORS_RIGHT_COLLECTION_ID,
+                                                     .max_flatbuffer_size = kSensorFlatbufferSize,
+                                                     .tensor_identifier = "joint_se3_pose",
+                                                     .localized_name = "Manus Sensors Right",
+                                                     .app_name = m_config.app_name });
+        }
+
+        if (!trackers.empty())
+        {
+            m_deviceio_session = core::DeviceIOSession::run(trackers, m_handles);
+        }
+        else
+        {
+            // Status-only or sensors-only sessions still need a DeviceIO clock for update().
+            m_deviceio_session = core::DeviceIOSession::run({}, m_handles);
+        }
 
         // Only attempt XDev hand tracker setup when the extension was actually enabled.
         // Skipping here avoids calling xrGetInstanceProcAddr for MNDX entry points that
@@ -300,8 +497,14 @@ void ManusTracker::initialize(const std::string& app_name) noexcept(false)
             initialize_xdev_hand_trackers();
         }
 
-        std::cout << "[Manus] Initialized with wrist source: " << (m_xdev_available ? "HandTracking" : "Controllers")
-                  << std::endl;
+        if (m_config.human)
+        {
+            m_logger->info("Initialized with wrist source: {}", m_xdev_available ? "HandTracking" : "Controllers");
+        }
+        else
+        {
+            m_logger->info("OpenXR session ready (human injection disabled).");
+        }
 
         success = true;
     }
@@ -312,8 +515,29 @@ void ManusTracker::initialize(const std::string& app_name) noexcept(false)
 
     if (!success)
     {
-        std::cerr << "[Manus] Warning: OpenXR initialization failed: " << error_msg << std::endl;
-        std::cerr << "[Manus] Continuing in Manus-only mode (no hand injection or OpenXR positioning)." << std::endl;
+        m_logger->warn("OpenXR initialization failed: {}", error_msg);
+        // Drop every OpenXR-related member that may have been created before the
+        // throw (trackers/injectors first — they may hold session handles).
+        cleanup_xdev_hand_trackers();
+        m_left_injector.reset();
+        m_right_injector.reset();
+        m_left_sensor_pusher.reset();
+        m_right_sensor_pusher.reset();
+        m_controller_tracker.reset();
+        m_hand_tracker.reset();
+        m_haptic_reader.reset();
+        m_status_publisher.reset();
+        m_deviceio_session.reset();
+        m_time_converter.reset();
+        m_session.reset();
+
+        if (monitoring_enabled)
+        {
+            shutdown_sdk();
+            throw std::runtime_error("Managed Manus launch requires an OpenXR monitoring session: " + error_msg);
+        }
+
+        m_logger->warn("Continuing in unmanaged Manus-only mode (no hand injection, sensor push, or OpenXR positioning).");
     }
 
     std::lock_guard<std::mutex> lock(m_lifecycle_mutex);
@@ -329,14 +553,22 @@ void ManusTracker::shutdown_sdk()
     CoreSdk_RegisterCallbackForRawSkeletonStream(nullptr);
     CoreSdk_RegisterCallbackForLandscapeStream(nullptr);
     CoreSdk_RegisterCallbackForErgonomicsStream(nullptr);
+    CoreSdk_RegisterCallbackForRawDeviceDataStream(nullptr);
+    // Left registered through DisconnectFromGloves()/CoreSdk_ShutDown() so their own
+    // shutdown-sequence log messages are still captured; unregistered last.
     DisconnectFromGloves();
     CoreSdk_ShutDown();
+    CoreSdk_RegisterCallbackForOnLog(nullptr);
 }
 
 void ManusTracker::RegisterCallbacks()
 {
     CoreSdk_RegisterCallbackForRawSkeletonStream(OnSkeletonStream);
     CoreSdk_RegisterCallbackForLandscapeStream(OnLandscapeStream);
+    if (m_config.sensors)
+    {
+        CoreSdk_RegisterCallbackForRawDeviceDataStream(OnRawDeviceDataStream);
+    }
 }
 
 void ManusTracker::ConnectToGloves() noexcept(false)
@@ -346,7 +578,7 @@ void ManusTracker::ConnectToGloves() noexcept(false)
     const auto retry_delay = std::chrono::milliseconds(1000); // 1 second delay between attempts
     int attempts = 0;
 
-    std::cout << "Looking for Manus gloves..." << std::endl;
+    m_logger->info("Looking for Manus gloves...");
 
     while (!connected && attempts < max_attempts)
     {
@@ -354,7 +586,7 @@ void ManusTracker::ConnectToGloves() noexcept(false)
 
         if (const auto start_result = CoreSdk_LookForHosts(1, false); start_result != SDKReturnCode::SDKReturnCode_Success)
         {
-            std::cerr << "Failed to look for hosts (attempt " << attempts << "/" << max_attempts << ")" << std::endl;
+            m_logger->warn("Failed to look for hosts (attempt {}/{})", attempts, max_attempts);
             std::this_thread::sleep_for(retry_delay);
             continue;
         }
@@ -363,15 +595,14 @@ void ManusTracker::ConnectToGloves() noexcept(false)
         if (const auto number_result = CoreSdk_GetNumberOfAvailableHostsFound(&number_of_hosts_found);
             number_result != SDKReturnCode::SDKReturnCode_Success)
         {
-            std::cerr << "Failed to get number of available hosts (attempt " << attempts << "/" << max_attempts << ")"
-                      << std::endl;
+            m_logger->warn("Failed to get number of available hosts (attempt {}/{})", attempts, max_attempts);
             std::this_thread::sleep_for(retry_delay);
             continue;
         }
 
         if (number_of_hosts_found == 0)
         {
-            std::cerr << "Failed to find hosts (attempt " << attempts << "/" << max_attempts << ")" << std::endl;
+            m_logger->warn("Failed to find hosts (attempt {}/{})", attempts, max_attempts);
             std::this_thread::sleep_for(retry_delay);
             continue;
         }
@@ -381,7 +612,7 @@ void ManusTracker::ConnectToGloves() noexcept(false)
         if (const auto hosts_result = CoreSdk_GetAvailableHostsFound(available_hosts.data(), number_of_hosts_found);
             hosts_result != SDKReturnCode::SDKReturnCode_Success)
         {
-            std::cerr << "Failed to get available hosts (attempt " << attempts << "/" << max_attempts << ")" << std::endl;
+            m_logger->warn("Failed to get available hosts (attempt {}/{})", attempts, max_attempts);
             std::this_thread::sleep_for(retry_delay);
             continue;
         }
@@ -389,19 +620,19 @@ void ManusTracker::ConnectToGloves() noexcept(false)
         if (const auto connect_result = CoreSdk_ConnectToHost(available_hosts[0]);
             connect_result == SDKReturnCode::SDKReturnCode_NotConnected)
         {
-            std::cerr << "Failed to connect to host (attempt " << attempts << "/" << max_attempts << ")" << std::endl;
+            m_logger->warn("Failed to connect to host (attempt {}/{})", attempts, max_attempts);
             std::this_thread::sleep_for(retry_delay);
             continue;
         }
 
         connected = true;
         is_connected = true;
-        std::cout << "Successfully connected to Manus host after " << attempts << " attempts" << std::endl;
+        m_logger->info("Successfully connected to Manus host after {} attempts", attempts);
     }
 
     if (!connected)
     {
-        std::cerr << "Failed to connect to Manus gloves after " << max_attempts << " attempts" << std::endl;
+        m_logger->error("Failed to connect to Manus gloves after {} attempts", max_attempts);
         throw std::runtime_error("Failed to connect to Manus gloves");
     }
 }
@@ -412,8 +643,30 @@ void ManusTracker::DisconnectFromGloves()
     {
         CoreSdk_Disconnect();
         is_connected = false;
-        std::cout << "Disconnected from Manus gloves" << std::endl;
+        m_logger->info("Disconnected from Manus gloves");
     }
+}
+
+bool ManusTracker::apply_glove_calibration(uint32_t glove_id, bool is_left)
+{
+    auto& calibration_file = is_left ? m_left_calibration_file : m_right_calibration_file;
+    if (calibration_file.empty())
+    {
+        return true;
+    }
+
+    SetGloveCalibrationReturnCode result = SetGloveCalibrationReturnCode_Error;
+    const SDKReturnCode rc = CoreSdk_SetGloveCalibration(
+        glove_id, calibration_file.data(), static_cast<uint32_t>(calibration_file.size()), &result);
+    if (rc != SDKReturnCode::SDKReturnCode_Success || result != SetGloveCalibrationReturnCode_Success)
+    {
+        m_logger->warn("Failed to apply {} glove calibration file (glove id={}, SDK code={}, result={})",
+                       is_left ? "left" : "right", glove_id, static_cast<int>(rc), static_cast<int>(result));
+        return false;
+    }
+
+    m_logger->debug("Applied {} glove calibration file to glove id={}", is_left ? "left" : "right", glove_id);
+    return true;
 }
 
 void ManusTracker::OnSkeletonStream(const SkeletonStreamInfo* skeleton_stream_info)
@@ -428,11 +681,15 @@ void ManusTracker::OnSkeletonStream(const SkeletonStreamInfo* skeleton_stream_in
     for (uint32_t i = 0; i < skeleton_stream_info->skeletonsCount; i++)
     {
         RawSkeletonInfo skeleton_info;
-        CoreSdk_GetRawSkeletonInfo(i, &skeleton_info);
+        if (CoreSdk_GetRawSkeletonInfo(i, &skeleton_info) != SDKReturnCode::SDKReturnCode_Success)
+        {
+            continue;
+        }
 
         std::vector<SkeletonNode> nodes(skeleton_info.nodesCount);
         skeleton_info.publishTime = skeleton_stream_info->publishTime;
-        CoreSdk_GetRawSkeletonData(i, nodes.data(), skeleton_info.nodesCount);
+        const bool skeleton_read_succeeded = CoreSdk_GetRawSkeletonData(i, nodes.data(), skeleton_info.nodesCount) ==
+                                             SDKReturnCode::SDKReturnCode_Success;
 
         uint32_t glove_id = skeleton_info.gloveId;
 
@@ -446,7 +703,7 @@ void ManusTracker::OnSkeletonStream(const SkeletonStreamInfo* skeleton_stream_in
 
         if (!is_left_glove && !is_right_glove)
         {
-            std::cerr << "Skipping data from unknown glove ID: " << glove_id << std::endl;
+            tracker.m_logger->warn("Skipping data from unknown glove ID: {}", glove_id);
             continue;
         }
 
@@ -455,13 +712,21 @@ void ManusTracker::OnSkeletonStream(const SkeletonStreamInfo* skeleton_stream_in
         // Save data for OpenXR Injection
         {
             std::lock_guard<std::mutex> lock(tracker.m_skeleton_mutex);
+            if (!skeleton_read_succeeded)
+            {
+                tracker.m_skeleton_stamps[is_left_glove ? 0 : 1] = {};
+                continue;
+            }
+
             if (is_left_glove)
             {
                 tracker.m_left_hand_nodes = nodes;
+                tracker.m_skeleton_stamps[0] = std::chrono::steady_clock::now();
             }
             else if (is_right_glove)
             {
                 tracker.m_right_hand_nodes = nodes;
+                tracker.m_skeleton_stamps[1] = std::chrono::steady_clock::now();
             }
         }
     }
@@ -483,7 +748,7 @@ void ManusTracker::OnLandscapeStream(const Landscape* landscape)
     // We only support one left and one right glove
     if (gloves.gloveCount > 2)
     {
-        std::cerr << "Invalid number of gloves detected: " << gloves.gloveCount << std::endl;
+        tracker.m_logger->warn("Invalid number of gloves detected: {}", gloves.gloveCount);
         return;
     }
 
@@ -495,8 +760,13 @@ void ManusTracker::OnLandscapeStream(const Landscape* landscape)
         const GloveLandscapeData& glove = gloves.gloves[i];
         if (glove.side == Side::Side_Left)
         {
-            tracker.left_glove_id = glove.id;
             left_present = true;
+            if (tracker.left_glove_id != glove.id)
+            {
+                tracker.left_glove_id = glove.id;
+                tracker.m_calibration_failed[0] = !tracker.apply_glove_calibration(glove.id, true);
+                tracker.m_logger->info("Left glove connected (ID {}); start streaming.", glove.id);
+            }
             // Fetch bone topology once on connect
             uint32_t nc = 0;
             if (get_raw_skeleton_node_count(glove.id, nc) == SDKReturnCode::SDKReturnCode_Success && nc > 0)
@@ -510,8 +780,13 @@ void ManusTracker::OnLandscapeStream(const Landscape* landscape)
         }
         else if (glove.side == Side::Side_Right)
         {
-            tracker.right_glove_id = glove.id;
             right_present = true;
+            if (tracker.right_glove_id != glove.id)
+            {
+                tracker.right_glove_id = glove.id;
+                tracker.m_calibration_failed[1] = !tracker.apply_glove_calibration(glove.id, false);
+                tracker.m_logger->info("Right glove connected (ID {}); start streaming.", glove.id);
+            }
             uint32_t nc = 0;
             if (get_raw_skeleton_node_count(glove.id, nc) == SDKReturnCode::SDKReturnCode_Success && nc > 0)
             {
@@ -532,19 +807,239 @@ void ManusTracker::OnLandscapeStream(const Landscape* landscape)
         std::lock_guard<std::mutex> skeleton_lock(tracker.m_skeleton_mutex);
         if (!left_present && tracker.left_glove_id.has_value())
         {
-            std::cout << "[Manus] Left glove disconnected (ID " << *tracker.left_glove_id << ")" << std::endl;
+            tracker.m_logger->warn("Left glove disconnected (ID {})", *tracker.left_glove_id);
             tracker.left_glove_id.reset();
+            tracker.m_calibration_failed[0] = false;
             tracker.m_left_hand_nodes.clear();
+            tracker.m_skeleton_stamps[0] = {};
             tracker.m_left_node_info.clear();
+            {
+                std::lock_guard<std::mutex> sensor_lock(tracker.m_sensor_mutex);
+                tracker.m_sensor_count[0] = 0;
+            }
         }
         if (!right_present && tracker.right_glove_id.has_value())
         {
-            std::cout << "[Manus] Right glove disconnected (ID " << *tracker.right_glove_id << ")" << std::endl;
+            tracker.m_logger->warn("Right glove disconnected (ID {})", *tracker.right_glove_id);
             tracker.right_glove_id.reset();
+            tracker.m_calibration_failed[1] = false;
             tracker.m_right_hand_nodes.clear();
+            tracker.m_skeleton_stamps[1] = {};
             tracker.m_right_node_info.clear();
+            {
+                std::lock_guard<std::mutex> sensor_lock(tracker.m_sensor_mutex);
+                tracker.m_sensor_count[1] = 0;
+            }
         }
     }
+}
+
+void ManusTracker::OnLog(LogSeverity p_Severity, const char* p_Log, uint32_t p_Length) noexcept
+{
+    // Handed to the Manus SDK as a C callback, so nothing may escape: constructing the
+    // std::string can throw bad_alloc, and Logger::get() allocates and touches spdlog's
+    // registry on first use. Unwinding into the SDK's own frames is undefined behaviour,
+    // and this fires from inside CoreSdk_InitializeIntegrated(). Dropping one vendor log
+    // line is the acceptable outcome; there is nowhere to report the failure, because
+    // logging is the thing that failed.
+    try
+    {
+        // Deliberately does not go through instance(): this can fire synchronously from
+        // CoreSdk_InitializeIntegrated(), called mid-constructor, before the function-local
+        // static in instance() has finished constructing -- reentering that initialization
+        // from the same thread is undefined behavior. Look the logger up directly by name
+        // instead.
+        //
+        // Keep the SDK stream distinct from the plugin's own diagnostics so readers,
+        // set_console_logger_name_filter() and set_logger_colors() can distinguish them.
+        static const auto logger = isaaccapture::Logger::get("isaaccapture.plugins.manus.ManusSdk");
+        const std::string message(p_Log, p_Length);
+
+        // Inherit the SDK's own severity rather than collapsing everything to one level.
+        switch (p_Severity)
+        {
+        case LogSeverity_Debug:
+            logger->debug("{}", message);
+            break;
+        case LogSeverity_Info:
+            logger->info("{}", message);
+            break;
+        case LogSeverity_Warn:
+            logger->warn("{}", message);
+            break;
+        case LogSeverity_Error:
+            logger->error("{}", message);
+            break;
+        default:
+            logger->info("{}", message);
+            break;
+        }
+    }
+    catch (...)
+    {
+    }
+}
+
+void ManusTracker::OnRawDeviceDataStream(const RawDeviceDataInfo* raw_device_data_info)
+{
+    auto& tracker = instance();
+    std::lock_guard<std::mutex> instance_lock(tracker.m_lifecycle_mutex);
+    if (!tracker.m_initialized || !tracker.m_config.sensors)
+    {
+        return;
+    }
+
+    for (uint32_t i = 0; i < raw_device_data_info->rawDeviceDataCount; ++i)
+    {
+        RawDeviceData raw{};
+        if (CoreSdk_GetRawDeviceData(i, &raw) != SDKReturnCode::SDKReturnCode_Success)
+        {
+            continue;
+        }
+
+        bool is_left = false;
+        bool is_right = false;
+        {
+            std::lock_guard<std::mutex> landscape_lock(tracker.landscape_mutex);
+            is_left = tracker.left_glove_id && raw.id == *tracker.left_glove_id;
+            is_right = tracker.right_glove_id && raw.id == *tracker.right_glove_id;
+        }
+        if (!is_left && !is_right)
+        {
+            continue;
+        }
+
+        const size_t side = is_left ? 0 : 1;
+        if (raw.sensorCount == 0)
+        {
+            // Clear cached count so push_sensor_side stops emitting stale tips.
+            std::lock_guard<std::mutex> sensor_lock(tracker.m_sensor_mutex);
+            tracker.m_sensor_count[side] = 0;
+            continue;
+        }
+
+        const uint32_t count = std::min(raw.sensorCount, static_cast<uint32_t>(kManusSensorCount));
+        std::lock_guard<std::mutex> sensor_lock(tracker.m_sensor_mutex);
+        tracker.m_sensor_count[side] = count;
+        for (uint32_t j = 0; j < count; ++j)
+        {
+            tracker.m_sensor_transforms[side][j] = raw.sensorData[j];
+        }
+    }
+}
+
+void ManusTracker::push_sensor_states()
+{
+    if (m_left_sensor_pusher)
+    {
+        push_sensor_side(true, *m_left_sensor_pusher);
+    }
+    if (m_right_sensor_pusher)
+    {
+        push_sensor_side(false, *m_right_sensor_pusher);
+    }
+}
+
+void ManusTracker::publish_device_status()
+{
+    if (!m_status_publisher)
+    {
+        return;
+    }
+
+    std::vector<plugin_utils::PluginDeviceStatusEntry> entries;
+    entries.reserve(2);
+
+    if (!m_config.human)
+    {
+        for (const char* path : { "/hand/left", "/hand/right" })
+        {
+            entries.push_back(plugin_utils::PluginDeviceStatusEntry{
+                .path = path,
+                .state = core::PluginDeviceState_DISABLED,
+                .reason = core::PluginDeviceReason_DISABLED_BY_CONFIGURATION,
+            });
+        }
+    }
+    else
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> landscape_lock(landscape_mutex);
+        std::lock_guard<std::mutex> skeleton_lock(m_skeleton_mutex);
+        const auto append_side = [&entries](
+                                     const char* path, bool present, bool calibration_failed, bool has_current_skeleton)
+        {
+            plugin_utils::PluginDeviceStatusEntry entry{ .path = path };
+            if (!present)
+            {
+                entry.state = core::PluginDeviceState_DISCONNECTED;
+                entry.reason = core::PluginDeviceReason_NO_HARDWARE_SIGNAL;
+            }
+            else if (calibration_failed)
+            {
+                entry.state = core::PluginDeviceState_DEGRADED;
+                entry.reason = core::PluginDeviceReason_CALIBRATION_FAILED;
+                entry.error = "glove calibration failed";
+            }
+            else if (!has_current_skeleton)
+            {
+                entry.state = core::PluginDeviceState_DEGRADED;
+                entry.reason = core::PluginDeviceReason_NO_CURRENT_DATA;
+                entry.error = "glove present but has no current usable skeleton data";
+            }
+            else
+            {
+                entry.state = core::PluginDeviceState_CONNECTED;
+                entry.reason = core::PluginDeviceReason_NONE;
+            }
+            entries.push_back(std::move(entry));
+        };
+        append_side("/hand/left", left_glove_id.has_value(), m_calibration_failed[0],
+                    has_current_usable_skeleton(m_left_hand_nodes, m_skeleton_stamps[0], now));
+        append_side("/hand/right", right_glove_id.has_value(), m_calibration_failed[1],
+                    has_current_usable_skeleton(m_right_hand_nodes, m_skeleton_stamps[1], now));
+    }
+
+    m_status_publisher->publish_if_changed(entries, steady_now_ns());
+}
+
+void ManusTracker::push_sensor_side(bool is_left, core::SchemaPusher& pusher)
+{
+    const size_t side = is_left ? 0 : 1;
+    uint32_t count = 0;
+    std::array<ManusTransform, kManusSensorCount> transforms{};
+    {
+        std::lock_guard<std::mutex> sensor_lock(m_sensor_mutex);
+        count = m_sensor_count[side];
+        transforms = m_sensor_transforms[side];
+    }
+
+    // Hosts treat missing pushes as "no sensors"; only emit a full 5-tip pack.
+    if (count < static_cast<uint32_t>(kManusSensorCount))
+    {
+        return;
+    }
+
+    std::vector<core::JointSe3Pose> joints;
+    joints.reserve(static_cast<size_t>(kManusSensorCount));
+    for (int sensor = 0; sensor < kManusSensorCount; ++sensor)
+    {
+        const ManusTransform& t = transforms[static_cast<size_t>(sensor)];
+        joints.emplace_back(kManusSensorJoints[static_cast<size_t>(sensor)],
+                            core::Pose(core::Point(t.position.x, t.position.y, t.position.z),
+                                       core::Quaternion(t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w)));
+    }
+
+    const auto sample_time_ns = core::os_monotonic_now_ns();
+    flatbuffers::FlatBufferBuilder builder(kSensorFlatbufferSize);
+    const auto device_id =
+        builder.CreateString(is_left ? MANUS_SENSORS_LEFT_COLLECTION_ID : MANUS_SENSORS_RIGHT_COLLECTION_ID);
+    // Sort through the builder, not the object API: JointSe3PoseOutput::Pack() emits a keyed
+    // struct vector with CreateVectorOfStructs and does NOT sort it, which would leave the
+    // reader's LookupByKey searching an unsorted vector.
+    const auto joints_offset = builder.CreateVectorOfSortedStructs(&joints);
+    builder.Finish(core::CreateJointSe3PoseOutput(builder, core::JointType_HAND_RAW, joints_offset, device_id));
+    pusher.push_buffer(builder.GetBufferPointer(), builder.GetSize(), sample_time_ns, sample_time_ns);
 }
 
 void ManusTracker::initialize_xdev_hand_trackers()
@@ -562,7 +1057,7 @@ void ManusTracker::initialize_xdev_hand_trackers()
         !load_func("xrEnumerateXDevsMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfn_enumerate_xdevs)) ||
         !load_func("xrGetXDevPropertiesMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfn_get_xdev_properties)))
     {
-        std::cerr << "[Manus] XR_MNDX_xdev_space extension not available, falling back to controllers" << std::endl;
+        m_logger->warn("XR_MNDX_xdev_space extension not available, falling back to controllers");
         return;
     }
 
@@ -571,7 +1066,7 @@ void ManusTracker::initialize_xdev_hand_trackers()
         !load_func("xrDestroyHandTrackerEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfn_destroy_hand_tracker)) ||
         !load_func("xrLocateHandJointsEXT", reinterpret_cast<PFN_xrVoidFunction*>(&m_pfn_locate_hand_joints)))
     {
-        std::cerr << "[Manus] Hand tracking extension not available, falling back to controllers" << std::endl;
+        m_logger->warn("Hand tracking extension not available, falling back to controllers");
         return;
     }
 
@@ -580,7 +1075,7 @@ void ManusTracker::initialize_xdev_hand_trackers()
     XrResult result = m_pfn_create_xdev_list(m_handles.session, &create_info, &m_xdev_list);
     if (XR_FAILED(result))
     {
-        std::cerr << "[Manus] Failed to create XDevList, falling back to controllers" << std::endl;
+        m_logger->warn("Failed to create XDevList, falling back to controllers");
         return;
     }
 
@@ -589,7 +1084,7 @@ void ManusTracker::initialize_xdev_hand_trackers()
     result = m_pfn_enumerate_xdevs(m_xdev_list, 0, &xdev_count, nullptr);
     if (XR_FAILED(result) || xdev_count == 0)
     {
-        std::cerr << "[Manus] No XDevs found, falling back to controllers" << std::endl;
+        m_logger->warn("No XDevs found, falling back to controllers");
         return;
     }
 
@@ -647,10 +1142,11 @@ void ManusTracker::initialize_xdev_hand_trackers()
             serials_list += s;
             serials_list += '"';
         }
-        std::cerr << "[Manus] Could not match optical hand-tracking XDevs by serial. "
-                  << "Expected \"Head Device (0)\" (left) and \"Head Device (1)\" (right), "
-                  << "but found: [" << serials_list << "]. "
-                  << "These serial strings are runtime-specific and may have changed." << std::endl;
+        m_logger->warn(
+            "Could not match optical hand-tracking XDevs by serial. Expected \"Head Device (0)\" (left) "
+            "and \"Head Device (1)\" (right), but found: [{}]. These serial strings are "
+            "runtime-specific and may have changed.",
+            serials_list);
     }
 
     // Create hand trackers from XDevs
@@ -682,7 +1178,7 @@ void ManusTracker::initialize_xdev_hand_trackers()
     }
     else
     {
-        std::cerr << "[Manus] Failed to create native hand trackers, falling back to controllers" << std::endl;
+        m_logger->warn("Failed to create native hand trackers, falling back to controllers");
         cleanup_xdev_hand_trackers();
     }
 }
@@ -754,13 +1250,13 @@ bool ManusTracker::get_controller_wrist_pose(bool is_left, XrPosef& out_wrist_po
     const auto& tracked = is_left ? m_controller_tracker->get_left_controller(*m_deviceio_session) :
                                     m_controller_tracker->get_right_controller(*m_deviceio_session);
 
-    if (!tracked.data)
+    if (!tracked)
     {
         return false;
     }
 
     bool aim_valid = false;
-    XrPosef raw_pose = oxr_utils::get_aim_pose(*tracked.data, aim_valid);
+    XrPosef raw_pose = oxr_utils::get_aim_pose(*tracked, aim_valid);
 
     if (!aim_valid)
     {
@@ -776,19 +1272,23 @@ void ManusTracker::inject_hand_data()
 {
     std::vector<SkeletonNode> left_nodes;
     std::vector<SkeletonNode> right_nodes;
+    std::array<std::chrono::steady_clock::time_point, 2> skeleton_stamps;
 
     {
         std::lock_guard<std::mutex> lock(m_skeleton_mutex);
         left_nodes = m_left_hand_nodes;
         right_nodes = m_right_hand_nodes;
+        skeleton_stamps = m_skeleton_stamps;
     }
 
     // Get current XrTime from the system monotonic clock
     XrTime time = m_time_converter->os_monotonic_now();
+    const auto now = std::chrono::steady_clock::now();
 
-    auto process_hand = [&](const std::vector<SkeletonNode>& nodes, bool is_left)
+    auto process_hand =
+        [&](const std::vector<SkeletonNode>& nodes, std::chrono::steady_clock::time_point stamp, bool is_left)
     {
-        if (nodes.empty())
+        if (!has_current_usable_skeleton(nodes, stamp, now))
         {
             return;
         }
@@ -908,8 +1408,8 @@ void ManusTracker::inject_hand_data()
         }
     };
 
-    process_hand(left_nodes, true);
-    process_hand(right_nodes, false);
+    process_hand(left_nodes, skeleton_stamps[0], true);
+    process_hand(right_nodes, skeleton_stamps[1], false);
 }
 
 } // namespace manus

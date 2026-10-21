@@ -39,7 +39,7 @@ export interface TeleopProjectNode {
 export type TeleopProjectRegistry = Record<string, TeleopProjectNode>;
 
 /** Default teleop path when nothing is resolvable from URL hash or localStorage. */
-export const DEFAULT_TELEOP_PATH = 'sim';
+export const DEFAULT_TELEOP_PATH = 'generic';
 
 /** localStorage key that remembers the last-used teleop path across reloads. */
 const PATH_STORAGE_KEY = 'cxr.isaac.teleopPath';
@@ -76,6 +76,10 @@ export function saveStoredTeleopPath(path: string): void {
  * layer and take priority over any registry defaults.
  */
 export const TELEOP_PROJECTS: TeleopProjectRegistry = {
+  generic: {
+    label: 'Generic',
+    settings: { panelHiddenAtStart: false, headless: false },
+  },
   sim: {
     label: 'Simulation',
     settings: { panelHiddenAtStart: false, headless: false },
@@ -88,13 +92,14 @@ export const TELEOP_PROJECTS: TeleopProjectRegistry = {
     label: 'Real Robot',
     settings: { panelHiddenAtStart: true, headless: false },
     children: {
-      ros: { label: 'ROS' },
+      ros2: { label: 'ROS2', settings: { headless: true } },
       isaacros: { label: 'IsaacROS' },
       gear: {
         label: 'GEAR',
         children: {
           headless: { label: 'Headless', settings: { headless: true } },
           video: { label: 'Video streaming' },
+          sonic: { label: 'SONIC' },
         },
       },
     },
@@ -110,7 +115,10 @@ function pathSegments(teleopPath: string | undefined): string[] {
  * Copies only keys whose value is not `undefined`, so explicit `undefined` on a
  * descendant node inherits the ancestor's value.
  */
-function assignDefined(target: TeleopProjectSettings, source: TeleopProjectSettings | undefined): void {
+function assignDefined(
+  target: TeleopProjectSettings,
+  source: TeleopProjectSettings | undefined
+): void {
   if (!source) return;
   for (const [k, v] of Object.entries(source)) {
     if (v !== undefined) (target as Record<string, unknown>)[k] = v;
@@ -165,7 +173,10 @@ export function getProjectBreadcrumb(teleopPath: string | undefined): string[] {
 export function parseTeleopPathFromHash(hash: string): string | null {
   const cleaned = hash.replace(/^#\/?/, '');
   if (!cleaned) return null;
-  const segments = cleaned.split('/').filter(Boolean).map(s => s.toLowerCase());
+  const segments = cleaned
+    .split('/')
+    .filter(Boolean)
+    .map(s => s.toLowerCase());
   if (segments.length === 0) return null;
   const root = TELEOP_PROJECTS[segments[0]];
   if (!root) return null;

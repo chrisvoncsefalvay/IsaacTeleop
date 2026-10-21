@@ -11,7 +11,7 @@
 #
 # Options:
 #   --build           Force rebuild of test container (no cache)
-#   --python-version  Python version for test container (e.g. 3.10)
+#   --python-version  Python version for test container (e.g. 3.11)
 #   --help            Show this help message
 
 set -euo pipefail
@@ -86,7 +86,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --build           Force rebuild of test container (no cache)"
-            echo "  --python-version  Python version for test container (e.g. 3.10)"
+            echo "  --python-version  Python version for test container (e.g. 3.11)"
             echo "  --help            Show this help message"
             echo ""
             echo "Tests to run (edit CXR_PYTHON_GPU_TESTS/CXR_NATIVE_GPU_TESTS in this script):"
@@ -146,12 +146,15 @@ if ! docker compose version &> /dev/null; then
     exit 1
 fi
 
-# Check if we have GPU support
-if docker info 2>/dev/null | grep -q "Runtimes.*nvidia"; then
-    log_success "NVIDIA Docker runtime detected"
-else
-    log_warning "NVIDIA Docker runtime not detected - GPU tests may fail"
+# CSV-mode hosts need the NVIDIA runtime; legacy GPU hooks also work with runc.
+# Match keys: Go templates treat a missing runtime's zero-valued struct as true.
+DOCKER_RUNTIMES=$(docker info --format '{{range $name, $_ := .Runtimes}}{{println $name}}{{end}}')
+CXR_TEST_DOCKER_RUNTIME=runc
+if grep -Fxq nvidia <<< "$DOCKER_RUNTIMES"; then
+    CXR_TEST_DOCKER_RUNTIME=nvidia
 fi
+export CXR_TEST_DOCKER_RUNTIME
+log_info "Test Docker runtime: $CXR_TEST_DOCKER_RUNTIME"
 
 # Set up environment
 log_info "Setting up environment..."
@@ -225,31 +228,31 @@ if [[ ! -d "install/wheels" ]]; then
     exit 1
 fi
 
-WHEEL_COUNT=$(find install/wheels -name "isaacteleop-*.whl" | wc -l)
-if [[ "$WHEEL_COUNT" -eq 0 ]]; then
-    log_error "No isaacteleop wheel found in install/wheels/"
+WHEEL_COUNT=$(find install/wheels -name "isaaccapture-*.whl" | wc -l)
+if [[ "$WHEEL_COUNT" -ne 1 ]]; then
+    log_error "Expected exactly one isaaccapture wheel in install/wheels/, found $WHEEL_COUNT"
     exit 1
 fi
 
-log_success "Found $WHEEL_COUNT isaacteleop wheel(s) in install/wheels/"
+log_success "Found $WHEEL_COUNT isaaccapture wheel(s) in install/wheels/"
 
-# Make docker-compose.runtime install from a local wheel directory via pip find-links.
-export ISAACTELEOP_PIP_SPEC="isaacteleop[cloudxr]"
+# Select the exact CI wheel while resolving its transition dependency locally.
+WHEEL_PATH=$(find install/wheels -name "isaaccapture-*.whl")
+export ISAACTELEOP_PIP_SPEC="/workspace/${WHEEL_PATH}[cloudxr]"
 export ISAACTELEOP_PIP_FIND_LINKS="/workspace/install/wheels"
 export ISAACTELEOP_PIP_DEBUG=0
 log_info "Using ISAACTELEOP_PIP_SPEC=$ISAACTELEOP_PIP_SPEC"
 log_info "Using ISAACTELEOP_PIP_FIND_LINKS=$ISAACTELEOP_PIP_FIND_LINKS"
 log_info "Using ISAACTELEOP_PIP_DEBUG=$ISAACTELEOP_PIP_DEBUG"
 
-WHEEL_PATH=$(find install/wheels -name "isaacteleop-*.whl")
 WHEEL_BASENAME=$(basename "$WHEEL_PATH")
-EXPECTED_ISAACTELEOP_VERSION=$(echo "$WHEEL_BASENAME" | sed -E 's/^isaacteleop-([^-]+)-.*/\1/' | tr '_' '-')
+EXPECTED_ISAACTELEOP_VERSION=$(echo "$WHEEL_BASENAME" | sed -E 's/^isaaccapture-([^-]+)-.*/\1/' | tr '_' '-')
 if [[ -z "$EXPECTED_ISAACTELEOP_VERSION" ]]; then
     log_error "Failed to derive expected version from wheel name: $WHEEL_BASENAME"
     exit 1
 fi
 export EXPECTED_ISAACTELEOP_VERSION
-log_info "Expected isaacteleop version from wheel artifact: $EXPECTED_ISAACTELEOP_VERSION"
+log_info "Expected isaaccapture version from wheel artifact: $EXPECTED_ISAACTELEOP_VERSION"
 
 # Build test container
 log_info "Building test container..."

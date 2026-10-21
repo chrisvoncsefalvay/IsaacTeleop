@@ -15,9 +15,9 @@ import argparse
 import sys
 import time
 from datetime import datetime
-import isaacteleop.deviceio as deviceio
-import isaacteleop.oxr as oxr
-from isaacteleop.cloudxr import CloudXRLauncher
+import isaaccapture.deviceio as deviceio
+import isaaccapture.oxr as oxr
+from isaaccapture.cloudxr import CloudXRLauncher
 
 
 RECORD_DURATION_S = 10.0
@@ -133,13 +133,13 @@ def main():
                 right = hand_tracker.get_right_hand(replay_session)
 
                 print(f"[{elapsed:4.1f}s] Replay frame {replay_frame}")
-                if head.data and head.data.pose:
-                    p = head.data.pose.position
+                if head is not None and head.pose:
+                    p = head.pose.position
                     print(f"  Head  pos=({p.x:.3f}, {p.y:.3f}, {p.z:.3f})")
                 else:
                     print("  Head  pos=N/A")
-                print(f"  Left  hand={'present' if left.data else 'None'}")
-                print(f"  Right hand={'present' if right.data else 'None'}")
+                print(f"  Left  hand={'present' if left is not None else 'None'}")
+                print(f"  Right hand={'present' if right is not None else 'None'}")
                 print()
 
             replay_frame += 1

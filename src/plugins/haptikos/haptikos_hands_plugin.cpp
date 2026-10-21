@@ -15,7 +15,7 @@ namespace haptikos
 HaptikosHandsPlugin::HaptikosHandsPlugin(const std::string& plugin_root_id) noexcept(false) : m_root_id(plugin_root_id)
 {
     static_assert(XR_HAND_JOINT_COUNT_EXT == HAPTIKOS_NUM_OF_JOINTS, "Unexpected XR Hand Joint number");
-    std::cout << "Initializing HaptikosHandsPlugin with root: " << m_root_id << std::endl;
+    m_logger->info("Initializing with root: {}", m_root_id);
 
     // Create ControllerTracker first to get required extensions
     m_controller_tracker = std::make_shared<core::ControllerTracker>();
@@ -42,13 +42,13 @@ HaptikosHandsPlugin::HaptikosHandsPlugin(const std::string& plugin_root_id) noex
     m_running = true;
     m_thread = std::thread(&HaptikosHandsPlugin::worker_thread, this);
 
-    std::cout << "HaptikosHandsPlugin initialized and running" << std::endl;
+    m_logger->info("initialized and running");
 }
 
 
 HaptikosHandsPlugin::~HaptikosHandsPlugin()
 {
-    std::cout << "Shutting down HaptikosHandsPlugin..." << std::endl;
+    m_logger->info("Shutting down...");
 
     m_running = false;
     m_thread.join();
@@ -65,11 +65,11 @@ void HaptikosHandsPlugin::worker_thread()
     {
         auto frame_start = std::chrono::steady_clock::now();
 
-        core::ControllerSnapshotTrackedT left_tracked;
-        core::ControllerSnapshotTrackedT right_tracked;
+        core::Serialized<core::ControllerSnapshot> left_tracked;
+        core::Serialized<core::ControllerSnapshot> right_tracked;
 
-        core::HandPoseTrackedT left_hand;
-        core::HandPoseTrackedT rigth_hand;
+        core::Serialized<core::HandPose> left_hand;
+        core::Serialized<core::HandPose> rigth_hand;
 
         try
         {
@@ -82,14 +82,14 @@ void HaptikosHandsPlugin::worker_thread()
         }
         catch (const std::exception& e)
         {
-            std::cerr << "HaptikosHandsPlugin update error: " << e.what() << std::endl;
+            m_logger->error("update error: {}", e.what());
             m_left_injector.reset();
             m_right_injector.reset();
             std::exit(1);
         }
         catch (...)
         {
-            std::cerr << "HaptikosHandsPlugin update error: unknown exception" << std::endl;
+            m_logger->error("update error: unknown exception");
             m_left_injector.reset();
             m_right_injector.reset();
             std::exit(1);
@@ -101,11 +101,11 @@ void HaptikosHandsPlugin::worker_thread()
 
 
         bool rigth_published = false;
-        if (right_tracked.data)
+        if (right_tracked)
         {
             Haptikos::HandData right_data = m_client.GetData(true, Haptikos::GlobalToWrist, true, true, false);
             bool valid_wrist = false;
-            XrPosef rigth_controller = oxr_utils::get_aim_pose(*right_tracked.data, valid_wrist);
+            XrPosef rigth_controller = oxr_utils::get_aim_pose(*right_tracked, valid_wrist);
 
             if (right_data.IsValid() == 1 && valid_wrist)
             {
@@ -130,11 +130,11 @@ void HaptikosHandsPlugin::worker_thread()
 
 
         bool left_published = false;
-        if (left_tracked.data)
+        if (left_tracked)
         {
             Haptikos::HandData left_data = m_client.GetData(false, Haptikos::GlobalToWrist, true, true, false);
             bool valid_wrist = false;
-            XrPosef left_controller = oxr_utils::get_aim_pose(*left_tracked.data, valid_wrist);
+            XrPosef left_controller = oxr_utils::get_aim_pose(*left_tracked, valid_wrist);
 
             if (left_data.IsValid() == 1 && valid_wrist)
             {

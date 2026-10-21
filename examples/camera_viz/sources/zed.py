@@ -21,6 +21,7 @@ force a reopen past the threshold.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,11 +29,15 @@ from typing import List, Optional
 
 from pipeline import Frame, FrameSource, SourceSpec
 
-from ._helpers import notify
+from ._helpers import notify, notify_verbose
 
 
-def _notify(msg: str) -> None:
-    notify("zed", msg)
+def _notify(msg: str, level: int = logging.INFO) -> None:
+    notify("zed", msg, level)
+
+
+# Periodic capture-rate breadcrumb interval (verbose mode).
+_STATS_PERIOD_S = 5.0
 
 
 # Open() blocks inside pyzed's C extension; print a USB-3 hint after this
@@ -137,8 +142,8 @@ class _ZedCamera:
         except ImportError as e:
             raise RuntimeError(
                 "ZedSource requires CuPy + pyzed. "
-                "Install via `uv pip install cupy-cuda12x` and follow the ZED "
-                "SDK's Python install instructions for pyzed."
+                "Run `camera_viz.sh setup --with-zed` with the ZED SDK installed "
+                "to install pyzed and CuPy matching your CUDA toolkit."
             ) from e
 
         self._resolution_name = _resolution_for_dims(width, height)
@@ -275,7 +280,7 @@ class _ZedCamera:
             opened.set()
 
         if err != sl.ERROR_CODE.SUCCESS:
-            _notify(f"open failed ({err})")
+            _notify(f"open failed ({err})", logging.ERROR)
             try:
                 camera.close()
             except Exception:
@@ -288,14 +293,26 @@ class _ZedCamera:
         if actual_w != self._width or actual_h != self._height:
             _notify(
                 f"resolution mismatch (expected {self._width}x{self._height}, "
-                f"got {actual_w}x{actual_h})"
+                f"got {actual_w}x{actual_h})",
+                logging.ERROR,
             )
             camera.close()
             return False
 
+        # The SDK silently grants a lower rate than requested when the
+        # resolution/fps combination or the link can't sustain it (USB 2,
+        # shared bandwidth). Surface it — a 60 fps config quietly running
+        # at 30 is otherwise invisible until someone measures.
+        granted_fps = int(getattr(info.camera_configuration, "fps", 0) or 0)
+        if granted_fps and granted_fps != self._fps:
+            _notify(
+                f"SDK granted {granted_fps} fps (requested {self._fps}) — "
+                "unsupported resolution/fps combination or USB bandwidth cap"
+            )
+
         # Pyzed Mats are pitched GPU buffers — one per eye, reused every
         # grab() / retrieve_image() pair.
-        for eye, slot in self._slots.items():
+        for slot in self._slots.values():
             slot.zed_mat = sl.Mat()
 
         self._camera = camera
@@ -339,6 +356,8 @@ class _ZedCamera:
         }
 
         first_frame_seen = False
+        grab_count = 0
+        stats_t0 = time.monotonic()
         while not self._stop.is_set():
             if not self._connected:
                 now = time.monotonic()
@@ -349,7 +368,7 @@ class _ZedCamera:
                 try:
                     self._connected = self._open_camera()
                 except Exception as e:
-                    _notify(f"open failed ({e})")
+                    _notify(f"open failed ({e})", logging.ERROR)
                     self._close_camera()
                     self._reconnect_count += 1
                     continue
@@ -367,7 +386,7 @@ class _ZedCamera:
                     err in fatal_errors
                     or self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES
                 ):
-                    _notify(f"grab failed ({err}); reconnecting")
+                    _notify(f"grab failed ({err}); reconnecting", logging.ERROR)
                     self._close_camera()
                 continue
             self._consecutive_failures = 0
@@ -394,15 +413,36 @@ class _ZedCamera:
                 if retrieve_failed:
                     self._consecutive_failures += 1
                     if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        _notify("camera connection problem; reconnecting")
+                        _notify(
+                            "camera connection problem; reconnecting", logging.ERROR
+                        )
                         self._close_camera()
                 else:
                     self._consecutive_failures = 0
                     if not first_frame_seen:
                         first_frame_seen = True
                         _notify("streaming")
+                    # Measured capture rate + the SDK's own estimate.
+                    # get_current_fps() exposes auto-exposure throttling
+                    # (low light halves the sensor rate even when the
+                    # grant was 60) that a wall-clock count alone hides.
+                    grab_count += 1
+                    now = time.monotonic()
+                    if now - stats_t0 >= _STATS_PERIOD_S:
+                        measured = grab_count / (now - stats_t0)
+                        try:
+                            sdk_fps = float(self._camera.get_current_fps())
+                        except Exception:
+                            sdk_fps = 0.0
+                        notify_verbose(
+                            "zed",
+                            f"capture {measured:.1f} fps"
+                            + (f" (SDK current {sdk_fps:.1f})" if sdk_fps else ""),
+                        )
+                        grab_count = 0
+                        stats_t0 = now
             except Exception as e:
-                _notify(f"frame error ({e}); reconnecting")
+                _notify(f"frame error ({e}); reconnecting", logging.ERROR)
                 self._close_camera()
                 self._reconnect_count += 1
                 continue

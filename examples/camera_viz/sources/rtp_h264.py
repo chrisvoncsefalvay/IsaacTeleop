@@ -24,7 +24,7 @@ from transports import RtpH264Receiver
 
 from ._nv_decode import NvH264Decoder
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("isaaccapture.camera_viz.sources.rtp_h264")
 
 # How long to wait between failed receiver-start attempts (port busy,
 # missing GStreamer plugin, etc.).
@@ -52,8 +52,8 @@ class RtpH264Source(FrameSource):
             import cupy as cp
         except ImportError as e:
             raise RuntimeError(
-                "RtpH264Source requires CuPy. Install via "
-                "`uv pip install cupy-cuda12x`."
+                "RtpH264Source requires CuPy. Run `camera_viz.sh setup --with-rtp` "
+                "to install the package matching your CUDA toolkit."
             ) from e
 
         self._spec = SourceSpec(

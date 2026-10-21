@@ -4,12 +4,12 @@
 #pragma once
 
 #include <deviceio_base/message_channel_tracker_base.hpp>
+#include <log_bridge/logger.hpp>
 #include <mcap/tracker_channels.hpp>
 #include <schema/message_channel_generated.h>
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -48,7 +48,9 @@ using MessageChannelMcapViewers = McapTrackerViewers<MessageChannelMessagesRecor
 class ReplayMessageChannelTrackerImpl : public IMessageChannelTrackerImpl
 {
 public:
-    ReplayMessageChannelTrackerImpl(std::unique_ptr<mcap::McapReader> reader, std::string_view base_name);
+    ReplayMessageChannelTrackerImpl(std::unique_ptr<mcap::McapReader> reader,
+                                    std::string_view base_name,
+                                    const RecordedSchemas& recorded);
 
     ReplayMessageChannelTrackerImpl(const ReplayMessageChannelTrackerImpl&) = delete;
     ReplayMessageChannelTrackerImpl& operator=(const ReplayMessageChannelTrackerImpl&) = delete;
@@ -57,19 +59,19 @@ public:
 
     void update(int64_t monotonic_time_ns) override;
     MessageChannelStatus get_status() const override;
-    const MessageChannelMessagesTrackedT& get_messages() const override;
+    const Serialized<MessageChannelMessagesTracked>& get_messages() const override;
     void send_message(const std::vector<uint8_t>& payload) const override;
 
 private:
-    static int64_t record_monotonic_ns(const MessageChannelMessagesRecordT& record);
-
-    MessageChannelMessagesTrackedT messages_;
+    // The frame's batch, encoded from a builder local to update().
+    Serialized<MessageChannelMessagesTracked> messages_;
     std::unique_ptr<MessageChannelMcapViewers> mcap_viewers_;
     // Holds the first record of the next frame, peeked but not yet
     // consumed. McapTrackerViewers::read() advances the underlying
     // LinearMessageView, so detecting a timestamp boundary requires
     // buffering one record across update() calls.
-    std::optional<MessageChannelMessagesRecordT> pending_record_;
+    Serialized<MessageChannelMessagesRecord> pending_record_;
+    std::shared_ptr<spdlog::logger> logger_;
 };
 
 } // namespace core

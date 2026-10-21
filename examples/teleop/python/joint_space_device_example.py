@@ -12,9 +12,8 @@ device path on the Isaac Teleop side:
 
 It consumes joint state streamed by the real ``so101_leader`` plugin over the OpenXR tensor
 transport via a ``TeleopSession`` (the ``JointStateSource`` auto-discovers and polls the
-``JointStateTracker``). By default ``CloudXRLauncher`` starts the CloudXR runtime and WSS
-proxy in-process; pass ``--no-launch-cloudxr-runtime`` if you already sourced
-``~/.cloudxr/run/cloudxr.env``. Use ``--launch-plugin`` to spawn the synthetic plugin
+``JointStateTracker``). ``CloudXRLauncher`` attaches to the CloudXR runtime and WSS proxy,
+starting a background service if none is serving. Use ``--launch-plugin`` to spawn the synthetic plugin
 process automatically; otherwise start ``so101_leader`` (or any device pushing the same
 ``collection_id``) separately.
 
@@ -39,10 +38,10 @@ from pathlib import Path
 
 import numpy as np
 
-from isaacteleop.cloudxr import CloudXRLauncher
-from isaacteleop.retargeting_engine.deviceio_source_nodes import JointStateSource
-from isaacteleop.retargeting_engine.interface import OutputCombiner
-from isaacteleop.retargeters import (
+from isaaccapture.cloudxr import CloudXRLauncher
+from isaaccapture.retargeting_engine.deviceio_source_nodes import JointStateSource
+from isaaccapture.retargeting_engine.interface import OutputCombiner
+from isaaccapture.retargeters import (
     JointStateRetargeter,
     JointStateRetargeterConfig,
     TensorReorderer,
@@ -129,7 +128,7 @@ def run_live(
     mode: str, num_frames: int, urdf_path: str | None, ee_link: str, timeout_s: float
 ) -> None:
     """Consume the live so101_leader plugin stream through a TeleopSession over OpenXR."""
-    from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
+    from isaaccapture.teleop_session_manager import TeleopSession, TeleopSessionConfig
 
     source = JointStateSource(
         name="leader", collection_id=_COLLECTION_ID, joint_names=SO101_JOINTS

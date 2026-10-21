@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Isaac Teleop Dependencies
+# Isaac Capture Dependencies
 
 This directory contains all project dependencies, organized by type.
 
@@ -91,7 +91,7 @@ machine and are located via `find_package`.
 ### pybind11
 - **Source**: https://github.com/pybind/pybind11.git
 - **Version**: a2e59f0e7065404b44dfe92a28aca47ba1378dc4 (v2.11.0-182)
-- **Purpose**: C++/Python bindings for Isaac Teleop Python API
+- **Purpose**: C++/Python bindings for Isaac Capture Python API
 - **Build**: Header-only library
 - **License**: BSD-style
 
@@ -103,6 +103,17 @@ machine and are located via `find_package`.
   pose math, and world/head/lazy-locked layer placement. Fetched only when
   `BUILD_VIZ=ON`.
 - **Build**: Header-only library
+- **License**: MIT
+
+### spdlog
+- **Source**: https://github.com/gabime/spdlog.git
+- **Version**: v1.17.0
+- **Purpose**: C++ logging backing `isaaccapture::Logger` (`src/core/log_bridge`)
+  — named loggers, console/rotating-file sinks for standalone executables, and
+  the socket sink that forwards C++ records into the Python logging session.
+  Fetched unconditionally (not gated behind `BUILD_PYTHON_BINDINGS`), since
+  standalone plugin executables need it too.
+- **Build**: Static library
 - **License**: MIT
 
 ## Adding New Dependencies
@@ -125,4 +136,4 @@ To add a new third-party dependency:
 
 3. If you need to preserve a specific version, use the full commit SHA in GIT_TAG
 
-4. Update the [Build from Source](../docs/source/getting_started/build_from_source.rst) doc with any new requirements
+4. Update the [Build from Source](../docs/source/getting_started/build_from_source/index.rst) doc with any new requirements

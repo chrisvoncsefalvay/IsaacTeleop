@@ -5,11 +5,11 @@
 
 #include <mcap/recording_traits.hpp>
 #include <schema/hand_bfbs_generated.h>
+#include <schema/serialized.hpp>
 #include <schema/timestamp_generated.h>
 
 #include <cassert>
 #include <cstring>
-#include <iostream>
 
 namespace core
 {
@@ -18,21 +18,25 @@ namespace core
 // ReplayHandTrackerImpl
 // ============================================================================
 
-ReplayHandTrackerImpl::ReplayHandTrackerImpl(std::unique_ptr<mcap::McapReader> reader, std::string_view base_name)
+ReplayHandTrackerImpl::ReplayHandTrackerImpl(std::unique_ptr<mcap::McapReader> reader,
+                                             std::string_view base_name,
+                                             const RecordedSchemas& recorded)
     : mcap_viewers_(
           std::make_unique<HandMcapViewers>(std::move(reader),
                                             base_name,
                                             std::vector<std::string>(HandRecordingTraits::replay_channels.begin(),
-                                                                     HandRecordingTraits::replay_channels.end())))
+                                                                     HandRecordingTraits::replay_channels.end()),
+                                            recorded)),
+      logger_(isaaccapture::Logger::get("isaaccapture.core.ReplayHandTrackerImpl"))
 {
 }
 
-const HandPoseTrackedT& ReplayHandTrackerImpl::get_left_hand() const
+const Serialized<HandPose>& ReplayHandTrackerImpl::get_left_hand() const
 {
     return left_tracked_;
 }
 
-const HandPoseTrackedT& ReplayHandTrackerImpl::get_right_hand() const
+const Serialized<HandPose>& ReplayHandTrackerImpl::get_right_hand() const
 {
     return right_tracked_;
 }
@@ -43,22 +47,32 @@ void ReplayHandTrackerImpl::update(int64_t /*monotonic_time_ns*/)
     auto right_record = mcap_viewers_->read(1);
     if (left_record)
     {
-        left_tracked_.data = std::move(left_record->data);
+        left_tracked_ = left_record.narrow(left_record->data());
+        warned_no_left_data_ = false;
     }
     else
     {
-        std::cerr << "ReplayHandTrackerImpl: left hand data not found" << std::endl;
-        left_tracked_.data.reset();
+        if (!warned_no_left_data_)
+        {
+            logger_->warn("left hand data not found");
+            warned_no_left_data_ = true;
+        }
+        left_tracked_.reset();
     }
 
     if (right_record)
     {
-        right_tracked_.data = std::move(right_record->data);
+        right_tracked_ = right_record.narrow(right_record->data());
+        warned_no_right_data_ = false;
     }
     else
     {
-        std::cerr << "ReplayHandTrackerImpl: right hand data not found" << std::endl;
-        right_tracked_.data.reset();
+        if (!warned_no_right_data_)
+        {
+            logger_->warn("right hand data not found");
+            warned_no_right_data_ = true;
+        }
+        right_tracked_.reset();
     }
 }
 

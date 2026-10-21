@@ -56,6 +56,25 @@ std::unique_ptr<VizSession> VizSession::create(const Config& config)
     {
         throw std::invalid_argument("VizSession: window dimensions must be non-zero");
     }
+    // Reject rather than silently ignore: in both of these cases the
+    // device is already decided by someone else, and quietly dropping the
+    // request would leave the caller believing it landed on the GPU it
+    // asked for (see the header).
+    if (config.physical_device_index >= 0)
+    {
+        if (config.mode == DisplayMode::kXr)
+        {
+            throw std::invalid_argument(
+                "VizSession: physical_device_index is not supported in kXr — the OpenXR "
+                "runtime dictates the Vulkan device");
+        }
+        if (config.external_context != nullptr)
+        {
+            throw std::invalid_argument(
+                "VizSession: physical_device_index conflicts with external_context — the "
+                "context already has a device");
+        }
+    }
     std::unique_ptr<VizSession> s(new VizSession(config));
     s->init();
     return s;
@@ -82,6 +101,7 @@ void VizSession::init()
         vk_cfg.instance_extensions = backend_->required_instance_extensions();
         vk_cfg.device_extensions = backend_->required_device_extensions();
         vk_cfg.optional_device_extensions = backend_->optional_device_extensions();
+        vk_cfg.physical_device_index = config_.physical_device_index;
 
         // kXr: hand XrInstance + systemId to VkContext so it takes the
         // xrCreateVulkan*KHR path — lets the runtime interpose on
@@ -229,6 +249,18 @@ FrameInfo VizSession::begin_frame()
     current_frame_info_.resolution = compositor_ ? compositor_->resolution() : Resolution{};
     current_backend_frame_.reset();
 
+    // Drained here, not in poll_events: consume-once, and this is the one place
+    // per frame every caller sees. A latched pose is wrong from this frame on.
+    current_frame_info_.reference_space_changed = false;
+    if (config_.mode == DisplayMode::kXr && backend_)
+    {
+        auto* xr = static_cast<XrBackend*>(backend_.get());
+        if (auto* sess = xr->xr_session(); sess != nullptr)
+        {
+            current_frame_info_.reference_space_changed = sess->take_reference_space_changed();
+        }
+    }
+
     // Acquire the backend frame BEFORE returning so renderers calling
     // submit() against the returned FrameInfo's views are working with
     // the same per-eye poses xrEndFrame will submit later. Skip the
@@ -339,6 +371,25 @@ void VizSession::validate_layer_against_backend_(LayerBase* layer) const
         throw std::invalid_argument(
             "VizSession: layer was created from a different VkContext than the session's; "
             "build layers with VizSession::get_vk_context().");
+    }
+    // Native-only layers (cylinder / equirect) can't fall back to the
+    // composite draw path — reject them up front when the backend can't
+    // composite the shape, instead of failing on the first frame.
+    if (const auto shape = layer->required_native_shape(); shape.has_value())
+    {
+        if (!backend_->supports_native_layers())
+        {
+            throw std::invalid_argument("VizSession: layer '" + layer->name() +
+                                        "' requires native OpenXR composition (DisplayMode::kXr); "
+                                        "window/offscreen sessions cannot composite it");
+        }
+        if (!backend_->supports_native_layer_shape(*shape))
+        {
+            const char* ext = (*shape == NativeLayerShape::kCylinder) ? "XR_KHR_composition_layer_cylinder" :
+                                                                        "XR_KHR_composition_layer_equirect2";
+            throw std::invalid_argument("VizSession: layer '" + layer->name() + "' requires the " + ext +
+                                        " extension, which the OpenXR runtime does not advertise");
+        }
     }
     const uint32_t backend_view_count = backend_->is_xr() ? 2u : 1u;
     layer->validate_backend_compatibility(
@@ -481,6 +532,11 @@ VkPhysicalDevice VizSession::get_vk_physical_device() const noexcept
 uint32_t VizSession::get_vk_queue_family_index() const noexcept
 {
     return ctx_ptr_ ? ctx_ptr_->queue_family_index() : UINT32_MAX;
+}
+
+int VizSession::get_cuda_device_id() const noexcept
+{
+    return ctx_ptr_ ? ctx_ptr_->cuda_device_id() : -1;
 }
 
 VkRenderPass VizSession::get_render_pass() const noexcept

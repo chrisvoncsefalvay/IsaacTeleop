@@ -6,13 +6,14 @@
 #include <mcap/recording_traits.hpp>
 #include <oxr_utils/oxr_funcs.hpp>
 #include <schema/controller_bfbs_generated.h>
+#include <schema/serialized.hpp>
 #include <schema/timestamp_generated.h>
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <iostream>
+#include <optional>
 #include <stdexcept>
 
 namespace core
@@ -180,7 +181,7 @@ std::unique_ptr<ControllerMcapChannels> LiveControllerTrackerImpl::create_mcap_c
                                                                                         std::string_view base_name)
 {
     return std::make_unique<ControllerMcapChannels>(
-        writer, base_name, ControllerRecordingTraits::schema_name,
+        writer, base_name,
         std::vector<std::string>(ControllerRecordingTraits::recording_channels.begin(),
                                  ControllerRecordingTraits::recording_channels.end()));
 }
@@ -334,11 +335,16 @@ LiveControllerTrackerImpl::LiveControllerTrackerImpl(const OpenXRSessionHandles&
         throw std::runtime_error("Failed to attach action sets: " + std::to_string(result));
     }
 
-    std::cout << "ControllerTracker initialized (left + right) with action context" << std::endl;
+    logger_->info("ControllerTracker initialized (left + right) with action context");
 }
 
 void LiveControllerTrackerImpl::update(int64_t monotonic_time_ns)
 {
+    // Invalidate first, publish last: the encodes below are the only writers, so no exit
+    // path can leave a caller reading last frame's poses. That matters for both hands at
+    // once here -- a locate failure on the left aborts before the right is even queried.
+    left_tracked_.reset();
+    right_tracked_.reset();
     last_update_time_ = monotonic_time_ns;
     const XrTime xr_time = time_converter_.convert_monotonic_ns_to_xrtime(monotonic_time_ns);
 
@@ -356,19 +362,19 @@ void LiveControllerTrackerImpl::update(int64_t monotonic_time_ns)
     if (XR_FAILED(result))
     {
         // Policy: action sync failure is a critical tracker/runtime error.
-        // Ensure callers do not observe stale controller data after sync failure.
-        left_tracked_.data.reset();
-        right_tracked_.data.reset();
         throw std::runtime_error("[ControllerTracker] xrSyncActions2NV failed: " + std::to_string(result));
     }
 
+    std::optional<ControllerSnapshotT> left_native;
+    std::optional<ControllerSnapshotT> right_native;
+
     auto update_controller = [&](XrPath hand_path, const XrSpacePtr& grip_space, const XrSpacePtr& aim_space,
-                                 ControllerSnapshotTrackedT& tracked)
+                                 std::optional<ControllerSnapshotT>& tracked)
     {
         if (!get_pose_action_active(session_, core_funcs_, grip_pose_action_, hand_path))
         {
             // Policy: controller not active is a common runtime condition.
-            tracked.data.reset();
+            tracked.reset();
             return;
         }
 
@@ -379,7 +385,6 @@ void LiveControllerTrackerImpl::update(int64_t monotonic_time_ns)
         result = core_funcs_.xrLocateSpace(grip_space.get(), base_space_, xr_time, &grip_location);
         if (XR_FAILED(result))
         {
-            tracked.data.reset();
             throw std::runtime_error("[ControllerTracker] xrLocateSpace(grip) failed: " + std::to_string(result));
         }
         if (XR_SUCCEEDED(result))
@@ -400,7 +405,6 @@ void LiveControllerTrackerImpl::update(int64_t monotonic_time_ns)
         result = core_funcs_.xrLocateSpace(aim_space.get(), base_space_, xr_time, &aim_location);
         if (XR_FAILED(result))
         {
-            tracked.data.reset();
             throw std::runtime_error("[ControllerTracker] xrLocateSpace(aim) failed: " + std::to_string(result));
         }
         if (XR_SUCCEEDED(result))
@@ -430,32 +434,26 @@ void LiveControllerTrackerImpl::update(int64_t monotonic_time_ns)
         ControllerInputState inputs(primary_click, secondary_click, thumbstick_click, menu_click, thumbstick_x,
                                     thumbstick_y, squeeze_value, trigger_value);
 
-        if (!tracked.data)
-        {
-            tracked.data = std::make_shared<ControllerSnapshotT>();
-        }
-        tracked.data->grip_pose = std::make_shared<ControllerPose>(grip_pose);
-        tracked.data->aim_pose = std::make_shared<ControllerPose>(aim_pose);
-        tracked.data->inputs = std::make_shared<ControllerInputState>(inputs);
+        tracked.emplace();
+        tracked->grip_pose = std::make_shared<ControllerPose>(grip_pose);
+        tracked->aim_pose = std::make_shared<ControllerPose>(aim_pose);
+        tracked->inputs = std::make_shared<ControllerInputState>(inputs);
     };
 
-    update_controller(left_hand_path_, left_grip_space_, left_aim_space_, left_tracked_);
-    update_controller(right_hand_path_, right_grip_space_, right_aim_space_, right_tracked_);
+    update_controller(left_hand_path_, left_grip_space_, left_aim_space_, left_native);
+    update_controller(right_hand_path_, right_grip_space_, right_aim_space_, right_native);
 
-    if (mcap_channels_)
-    {
-        DeviceDataTimestamp timestamp(last_update_time_, last_update_time_, xr_time);
-        mcap_channels_->write(0, timestamp, left_tracked_.data);
-        mcap_channels_->write(1, timestamp, right_tracked_.data);
-    }
+    const DeviceDataTimestamp timestamp(last_update_time_, last_update_time_, xr_time);
+    left_tracked_ = publish_and_record(mcap_channels_.get(), 0, timestamp, value_ptr(left_native));
+    right_tracked_ = publish_and_record(mcap_channels_.get(), 1, timestamp, value_ptr(right_native));
 }
 
-const ControllerSnapshotTrackedT& LiveControllerTrackerImpl::get_left_controller() const
+const Serialized<ControllerSnapshot>& LiveControllerTrackerImpl::get_left_controller() const
 {
     return left_tracked_;
 }
 
-const ControllerSnapshotTrackedT& LiveControllerTrackerImpl::get_right_controller() const
+const Serialized<ControllerSnapshot>& LiveControllerTrackerImpl::get_right_controller() const
 {
     return right_tracked_;
 }
@@ -503,9 +501,8 @@ void LiveControllerTrackerImpl::apply_haptic_feedback(Side side, float amplitude
             bool expected = false;
             if (stop_haptic_error_logged_[slot].compare_exchange_strong(expected, true))
             {
-                std::cerr << "[ControllerTracker] xrStopHapticFeedback(" << side_name
-                          << ") failed: " << static_cast<int>(stop_result)
-                          << "; further errors for this side will be silenced." << std::endl;
+                logger_->warn("xrStopHapticFeedback({}) failed: {}; further errors for this side will be silenced.",
+                              side_name, static_cast<int>(stop_result));
             }
         }
         return;
@@ -535,9 +532,8 @@ void LiveControllerTrackerImpl::apply_haptic_feedback(Side side, float amplitude
         bool expected = false;
         if (apply_haptic_error_logged_[slot].compare_exchange_strong(expected, true))
         {
-            std::cerr << "[ControllerTracker] xrApplyHapticFeedback(" << side_name
-                      << ") failed: " << static_cast<int>(apply_result)
-                      << "; further errors for this side will be silenced." << std::endl;
+            logger_->warn("xrApplyHapticFeedback({}) failed: {}; further errors for this side will be silenced.",
+                          side_name, static_cast<int>(apply_result));
         }
     }
 }

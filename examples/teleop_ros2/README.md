@@ -20,8 +20,8 @@ publisher uses a different ID.
 
 ## Prerequisite: Hand Retargeting
 
-`hand_teleop` and the Sharpa variants of `controller_teleop` retarget OpenXR
-hand tracking to Sharpa hand joint commands via the `hand_retargeter`
+`hand_teleop` and the tracked-hand variants of `controller_teleop` retarget
+OpenXR hand tracking to robot hand joint commands via the `hand_retargeter`
 parameter:
 
 - `hand_retargeter:=mode_default` (default): keeps the mode-specific default
@@ -30,51 +30,108 @@ parameter:
 - `hand_retargeter:=trihand`: valid only with `controller_teleop`; retargets
   controller trigger/squeeze input to TriHand finger joints.
 - `hand_retargeter:=dexpilot`: uses `DexHandRetargeter` with DexPilot configs from
-  `examples/teleop_ros2/configs/`. It requires `isaacteleop[retargeters]` and
+  `examples/teleop_ros2/configs/`. It requires `isaaccapture[retargeters]` and
   official standalone Sharpa Wave URDFs at:
   `examples/teleop_ros2/assets/urdf/sharpa_standalone/left_sharpa_wave.urdf`
   and
   `examples/teleop_ros2/assets/urdf/sharpa_standalone/right_sharpa_wave.urdf`.
   Set `config_asset_root` to use a different directory containing `configs/`
-  and `assets/`; the empty default uses the installed or source example root.
+  and `assets/`; the empty default uses the installed or source tree root.
 - `hand_retargeter:=pink_ik`: uses `SharpaHandRetargeter`. It requires the
-  `isaacteleop[grounding]` runtime dependencies and the bundled
+  `isaaccapture[grounding]` runtime dependencies and the bundled
   `robotic_grounding` package data that provides the Sharpa MJCF assets.
+- `hand_retargeter:=wuji`: uses `WujiHandRetargeter` and requires
+  `isaaccapture[wuji]`. `wuji_hand_model` selects `wuji_hand` or `wuji_hand_2`
+  for both sides and defaults to `wuji_hand_2`. Each side publishes 20
+  firmware-order joints named `left_thumb_j0` through
+  `left_pinky_j3` and `right_thumb_j0` through `right_pinky_j3`.
 
-In `controller_teleop`, explicitly setting `hand_retargeter:=dexpilot` or
-`hand_retargeter:=pink_ik` keeps XR controllers responsible for EE poses, wrist
-TFs, locomotion, and `controller_data`, while Manus/OpenXR hand data drives
-`xr_teleop/hand` and Sharpa `xr_teleop/finger_joints`.
+In `controller_teleop`, `hand_retargeter` selects the finger-joint mapping.
+With `hand_tracking_provider:=native`, EE poses and wrist TFs come from XR
+controller aim poses. With `hand_tracking_provider:=manus`, they come from
+controller aim poses with the MANUS controller-to-hand calibration. With
+`hand_tracking_provider:=wuji`, they come from the provider-injected OpenXR
+wrists. Controllers continue to provide locomotion and `controller_data`.
 
 The Docker build fetches the pinned official Sharpa Wave URDFs and installs them
-at `/opt/isaacteleop/install/examples/teleop_ros2/assets/urdf/sharpa_standalone/`.
+at `/opt/isaaccapture/install/examples/teleop_ros2/assets/urdf/sharpa_standalone/`.
 Source-tree users can populate the same local asset directory from the repo root:
 
 ```bash
 python3 examples/teleop_ros2/scripts/fetch_sharpa_wave_urdfs.py
 ```
 
-Robot assets are never downloaded by `teleop_ros2_node.py` at runtime.
+Robot assets are never downloaded by the node at runtime.
+
+### OpenXR hand input sources
+
+The DexPilot, Pink IK, and Wuji hand retargeters can use native OpenXR hand
+tracking, MANUS gloves, or Wuji gloves. Set `hand_tracking_provider` to
+`native` (default), `manus`, or `wuji`. Use only one provider at a time.
+
+When `mcap_replay_path` is unset, the ROS node starts the selected MANUS or Wuji
+plugin by default. For manual launch, set
+`use_external_hand_tracking_plugin:=true`; the plugin and node must use the same
+CloudXR runtime path and network namespace, and the glove must be reachable from
+the plugin environment. A non-native provider requires `hand_teleop`, or
+`controller_teleop` with `dexpilot`, `pink_ik`, or `wuji`.
+
+#### MANUS glove input
+
+Follow the [MANUS device guide](../../docs/source/device/manus.rst) to install
+host USB permissions, the MANUS SDK, and the MANUS plugin.
+
+After the ROS node starts, run the following from the IsaacTeleop repository
+root in the environment where the MANUS plugin was built:
+
+```bash
+source "$HOME/.cloudxr/run/cloudxr.env"
+./install/plugins/manus/manus_hand_plugin --datasets=human
+```
+
+#### Wuji glove input
+
+Build the Wuji glove plugin from the repository root:
+
+```bash
+./src/plugins/wuji_glove/install.sh
+```
+
+After the ROS node starts, attach the plugin to the same CloudXR runtime:
+
+```bash
+source "$HOME/.cloudxr/run/cloudxr.env"
+./install/plugins/wuji_glove/wuji_glove_plugin
+```
+
+The Wuji glove plugin defaults to automatic wrist-source selection: optical
+hand tracking is preferred, with the mounted controller as fallback. Set
+`WUJI_GLOVE_WRIST_SOURCE` to `hand_tracking` or `controller` to force one
+source. Override mount calibration when needed:
+
+```bash
+export WUJI_GLOVE_AIM_TO_WRIST_LEFT="px,py,pz,qx,qy,qz,qw"
+export WUJI_GLOVE_AIM_TO_WRIST_RIGHT="px,py,pz,qx,qy,qz,qw"
+```
 
 ## Published Topics
 
-- `xr_teleop/hand` (`geometry_msgs/PoseArray`)
-  - `poses`: Hand joint poses (all joints except palm, left then right); published by `hand_teleop` and by `controller_teleop` when `hand_retargeter:=dexpilot` or `hand_retargeter:=pink_ik`
-- `xr_teleop/ee_pose_left` (`geometry_msgs/PoseStamped`)
-  - Left hand/controller EE pose; published when the left EE source is active
-- `xr_teleop/ee_pose_right` (`geometry_msgs/PoseStamped`)
-  - Right hand/controller EE pose; published when the right EE source is active
+- `xr_teleop/hand` (`teleop_ros2_interfaces/msg/NamedPoseArray`)
+  - Named OpenXR hand joint poses; always contains 25 `left_` entries followed by 25 `right_` entries, including `WRIST` and omitting `PALM`; missing or invalid joints use zero poses with `is_valid=false`
+- `xr_teleop/ee_poses` (`teleop_ros2_interfaces/msg/NamedPoseArray`)
+  - Named hand/controller EE poses; always contains `left` and `right` entries, with zero poses and `is_valid=false` for invalid sides
 - `xr_teleop/root_twist` (`geometry_msgs/TwistStamped`)
 - `xr_teleop/root_pose` (`geometry_msgs/PoseStamped`)
 - `xr_teleop/head_pose` (`geometry_msgs/PoseStamped`)
-  - Head pose; published in `controller_teleop` and `hand_teleop` modes when head tracking is valid
+  - Head pose
 - `xr_teleop/controller_data` (`std_msgs/ByteMultiArray`, msgpack-encoded dictionary)
 - `xr_teleop/finger_joints` (`sensor_msgs/JointState`)
-  - Retargeted finger joint angles for the robot; contains joint names and position arrays corresponding to the robot finger joints (TriHand in default `controller_teleop`, selected Sharpa retargeter in `hand_teleop`, or explicit Sharpa retargeter in `controller_teleop`)
+  - Retargeted finger joint angles for the robot; contains joint names and position arrays corresponding to the robot finger joints (TriHand in default `controller_teleop`, or the selected Sharpa/Wuji retargeter in tracked-hand modes)
 - `/tf` (`tf2_msgs/TFMessage`)
   - `world_frame` → `right_wrist_frame`: Right wrist transform (published in `controller_teleop` and `hand_teleop` modes)
   - `world_frame` → `left_wrist_frame`: Left wrist transform (published in `controller_teleop` and `hand_teleop` modes)
   - `world_frame` → `head_frame`: Head transform (published in `controller_teleop` and `hand_teleop` modes)
+  - With `ee_poses_frame:=head` the wrist transforms are parented to `head_frame` instead of `world_frame`
 
 ## Run in Docker
 
@@ -82,17 +139,33 @@ Robot assets are never downloaded by `teleop_ros2_node.py` at runtime.
 
 From the repo root.
 
-**Humble (default):**
+**Jazzy (default):**
 ```bash
 docker build -f examples/teleop_ros2/Dockerfile -t teleop_ros2_ref .
 ```
 
-**Jazzy:**
+ROS 2 Humble is no longer supported: it ships Python 3.10, which is below the
+`isaaccapture` wheel's minimum of 3.11. Another distro needs `ROS_DISTRO` and
+`PYTHON_VERSION` overridden together, and its interpreter must be 3.11 or newer:
+
 ```bash
-docker build -f examples/teleop_ros2/Dockerfile --build-arg ROS_DISTRO=jazzy --build-arg PYTHON_VERSION=3.12 -t teleop_ros2_ref:jazzy .
+docker build -f examples/teleop_ros2/Dockerfile --build-arg ROS_DISTRO=<distro> --build-arg PYTHON_VERSION=<py> -t teleop_ros2_ref:<distro> .
 ```
 
-You can tag by distro (e.g. `teleop_ros2_ref:humble`, `teleop_ros2_ref:jazzy`) to build and run both side by side.
+You can tag by distro (e.g. `teleop_ros2_ref:jazzy`) to build and run several side by side.
+
+The default image includes the Wuji glove plugin on amd64 and arm64. To include
+the MANUS plugin in an amd64 image, review the
+[MANUS Software License Agreement](https://www.manus-meta.com/software-license-agreement),
+confirm that your license permits this use, and explicitly accept it:
+
+```bash
+export MANUS_ACCEPT_EULA=YES
+docker build --build-arg MANUS_ACCEPT_EULA \
+  -f examples/teleop_ros2/Dockerfile -t teleop_ros2_ref:manus .
+```
+
+MANUS is skipped on non-amd64 builds.
 
 Incremental rebuilds use Docker BuildKit cache. Ensure BuildKit is enabled (default in Docker 23+), or run with `DOCKER_BUILDKIT=1 docker build ...`.
 
@@ -108,6 +181,25 @@ docker run --rm --gpus all --net=host --ipc=host \
   teleop_ros2_ref --ros-args -p cloudxr_accept_eula:=true
 ```
 
+All device plugins used with Docker must run in the `teleop_ros2_ref`
+container. The node starts managed hand-tracking plugins automatically; launch
+external plugins such as `foot_pedal_reader` in the running container with
+`docker exec`.
+
+Select the hand provider independently from the robot-hand retargeter. The node
+starts the selected plugin automatically:
+
+- Wuji gloves driving Sharpa hands:
+  `-p hand_tracking_provider:=wuji -p hand_retargeter:=dexpilot`
+- MANUS gloves driving Wuji Hand 2:
+  `-p hand_tracking_provider:=manus -p hand_retargeter:=wuji -p wuji_hand_model:=wuji_hand_2`
+
+Wuji gloves must be reachable through the container's host network. Pass Wuji
+configuration overrides into the container with `docker run -e <name>=<value>`.
+MANUS also requires the
+[host udev setup](../../docs/source/device/manus.rst) and USB access; add
+`-v /dev/bus/usb:/dev/bus/usb` to the MANUS `docker run` command.
+
 ### Overriding parameters and remapping topics
 
 It's possible to set ROS 2 parameters and remap topics from the command line when running the container. Append `--ros-args -p param_name:=value` to set parameters, or `--ros-args -r old_topic:=new_topic` to remap topics after the image name:
@@ -121,15 +213,14 @@ docker run --rm --gpus all --net=host --ipc=host \
   teleop_ros2_ref --ros-args -p cloudxr_accept_eula:=true \
   -p world_frame:=odom -p rate_hz:=30.0 \
   -r xr_teleop/hand:=my_robot/hand \
-  -r xr_teleop/ee_pose_left:=my_robot/ee_pose_left \
-  -r xr_teleop/ee_pose_right:=my_robot/ee_pose_right
+  -r xr_teleop/ee_poses:=my_robot/ee_poses
 ```
 
-Available parameters: `rate_hz`, `mode`, `hand_retargeter`, `config_asset_root`, `cloudxr_install_dir`, `cloudxr_env_config`, `cloudxr_accept_eula`, `cloudxr_setup_oob`, `cloudxr_usb_local`, `pedal_collection_id`, `world_frame`, `right_wrist_frame`, `left_wrist_frame`, `head_frame`, `left_finger_joint_names`, `right_finger_joint_names`. Use `ros2 param list /teleop_ros2_node` and `ros2 param describe /teleop_ros2_node <param>` (with the node running) for the full set.
+Available parameters: `rate_hz`, `mode`, `hand_retargeter`, `hand_tracking_provider`, `use_external_hand_tracking_plugin`, `wuji_hand_model`, `config_asset_root`, `cloudxr_install_dir`, `cloudxr_env_config`, `cloudxr_client_route`, `cloudxr_accept_eula`, `cloudxr_setup_oob`, `cloudxr_usb_local`, `pedal_collection_id`, `world_frame`, `right_wrist_frame`, `left_wrist_frame`, `head_frame`, `ee_poses_frame`, `left_finger_joint_names`, `right_finger_joint_names`. Use `ros2 param list /teleop_ros2_node` and `ros2 param describe /teleop_ros2_node <param>` (with the node running) for the full set.
 
 By default, `left_finger_joint_names` and `right_finger_joint_names` use the selected mode's retargeter joint names. They can be overridden to publish robot-specific names on `xr_teleop/finger_joints`, but each override must provide the same number of names as the joints emitted by that mode's retargeter.
 
-Available topics for remapping: `xr_teleop/hand`, `xr_teleop/ee_pose_left`, `xr_teleop/ee_pose_right`, `xr_teleop/root_twist`, `xr_teleop/root_pose`, `xr_teleop/head_pose`, `xr_teleop/controller_data`, `xr_teleop/full_body`, `xr_teleop/finger_joints`. Active remaps can be inspected with `ros2 node info /teleop_ros2_node`.
+Available topics for remapping: `xr_teleop/hand`, `xr_teleop/ee_poses`, `xr_teleop/root_twist`, `xr_teleop/root_pose`, `xr_teleop/head_pose`, `xr_teleop/controller_data`, `xr_teleop/full_body`, `xr_teleop/finger_joints`. Active remaps can be inspected with `ros2 node info /teleop_ros2_node`.
 
 ### Mode
 
@@ -137,12 +228,44 @@ The `mode` parameter selects the teleoperation scenario and which topics are pub
 
 | Mode | Topics published |
 |------|------------------|
-| `controller_teleop` (default) | `ee_pose_left`, `ee_pose_right` (from controller aim pose), `root_twist`, `root_pose`, `head_pose`, `finger_joints` (TriHand by default; Sharpa from Manus/OpenXR hands when `hand_retargeter:=dexpilot` or `hand_retargeter:=pink_ik`), `controller_data`, `tf` (from controller aim pose and head pose), and `hand` only for the explicit Sharpa retargeter path |
-| `hand_teleop` | `ee_pose_left`, `ee_pose_right` (from hand tracking wrist), `hand` (finger joints in pose space), `finger_joints` (finger joints in joint space), `root_twist`, `root_pose`, `head_pose`, `tf` (from hand tracking wrist and head pose); locomotion comes from the configured foot pedal collection |
+| `controller_teleop` (default) | `ee_poses`, `root_twist`, `root_pose`, `head_pose`, `finger_joints`, `controller_data`, and `tf`; TriHand uses controller-derived finger joints and EE poses. Explicit Sharpa or Wuji retargeters add `hand`; `native` uses controller aim for EE poses, `manus` applies the MANUS calibration to controller aim, and `wuji` uses provider-injected wrist poses |
+| `hand_teleop` | `ee_poses` (from hand tracking wrists), `hand` (named left and right joint poses), `finger_joints` (finger joints in joint space), `root_twist`, `root_pose`, `head_pose`, `tf` (from hand tracking wrists and head pose); locomotion comes from the configured foot pedal collection |
 | `controller_raw` | `controller_data` only |
 | `full_body` | `full_body` and `controller_data` |
 
 Example: `--ros-args -p mode:=controller_raw`
+
+### EE Poses Frame
+
+The `ee_poses_frame` parameter selects the reference frame of `xr_teleop/ee_poses`:
+
+| Value | Behavior |
+|-------|----------|
+| `world` (default) | Absolute poses in `world_frame`; wrist TFs parented to `world_frame` |
+| `head` | Poses relative to the headset, stamped `head_frame`; wrist TFs parented to `head_frame` |
+
+Head mode transforms both position and orientation using
+`T_head_ee = inverse(T_world_head) @ T_world_ee`. The head and EE inputs come from
+the same session step, after the configured world-frame coordinate conversion
+and any controller-to-hand calibration. Head-relative poses stay fixed when the
+head and EEs undergo the same rigid motion; moving only the head changes them.
+
+If the head pose is absent or invalid, the EE message keeps the configured
+`head_frame`, both entries are marked `is_valid: false`, and no wrist TFs are
+broadcast until a valid head pose returns. There is no fallback to `world_frame`.
+Consumers must honor `is_valid`; invalid entries contain placeholder poses, not
+robot targets. The head pose and head TF remain relative to `world_frame`, and
+other topics are unchanged.
+
+```bash
+docker run --rm --gpus all --net=host --ipc=host \
+  -e NVIDIA_VISIBLE_DEVICES=all -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e ROS_LOCALHOST_ONLY=1 \
+  -v $HOME/.cloudxr:/root/.cloudxr \
+  --name teleop_ros2_ref \
+  teleop_ros2_ref --ros-args -p cloudxr_accept_eula:=true \
+  -p ee_poses_frame:=head
+```
 
 ### OOB Teleop Control
 
@@ -193,9 +316,8 @@ coverage.
 ```bash
 docker exec -it teleop_ros2_ref /bin/bash
 
-ros2 topic echo /xr_teleop/hand geometry_msgs/msg/PoseArray
-ros2 topic echo /xr_teleop/ee_pose_left geometry_msgs/msg/PoseStamped
-ros2 topic echo /xr_teleop/ee_pose_right geometry_msgs/msg/PoseStamped
+ros2 topic echo /xr_teleop/hand teleop_ros2_interfaces/msg/NamedPoseArray
+ros2 topic echo /xr_teleop/ee_poses teleop_ros2_interfaces/msg/NamedPoseArray
 ros2 topic echo /xr_teleop/root_twist geometry_msgs/msg/TwistStamped
 ros2 topic echo /xr_teleop/root_pose geometry_msgs/msg/PoseStamped
 ros2 topic echo /xr_teleop/head_pose geometry_msgs/msg/PoseStamped

@@ -18,202 +18,151 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import signal
 import sys
-from dataclasses import dataclass
+import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import yaml
 
-import isaacteleop.viz as viz
+from isaaccapture import logging_config
+from isaaccapture.cloudxr import CloudXRLauncher
 
-from pipeline import FrameSource, VizRunner
-from placements import PlacementConfig, PlacementStrategy, build as build_placement
-from sources import PairedFrameSource, RtpH264Source, build_local_camera, set_verbose
-
-
-@dataclass
-class SourceEntry:
-    """source + placement + stereo cfg; drives QuadLayer construction."""
-
-    source: FrameSource
-    placement: Optional[PlacementStrategy]
-    stereo: bool = False
-    stereo_baseline_mm: float = 0.0
-
-
-def _build_placement(spec: Optional[dict], is_xr: bool) -> Optional[PlacementStrategy]:
-    if not is_xr or spec is None:
-        return None
-    cfg_kwargs = {}
-    if "size" in spec:
-        cfg_kwargs["size_meters"] = tuple(spec["size"])
-    for key in (
-        "distance",
-        "offset_x",
-        "offset_y",
-        "look_away_angle_deg",
-        "reposition_distance",
-        "reposition_delay_s",
-        "transition_duration_s",
-    ):
-        if key in spec:
-            cfg_kwargs[key] = spec[key]
-    cfg = PlacementConfig(**cfg_kwargs)
-    return build_placement(spec.get("lock_mode", "lazy"), cfg)
+import cloudxr_env
+import config
+import display
+from controls import (
+    ControllerControls,
+    ControlTarget,
+    controls_config_from_yaml,
+    make_hud,
+)
+from dashboard import Dashboard
+from pipeline import VizRunner
+from sources import resolve_video_paths, set_notify_sink, set_verbose
 
 
-def _enabled_cameras(cfg: dict) -> List[dict]:
-    return [c for c in cfg.get("cameras", []) if c.get("enabled", True)]
-
-
-# Default plane width when ``size`` is omitted from a placement block.
-# Height is derived from the camera's pixel aspect ratio so the rendered
-# plane keeps the picture's shape.
-_DEFAULT_PLANE_WIDTH_M = 1.0
-
-
-def _placement_with_aspect(
-    spec: Optional[dict], cam: dict, is_xr: bool
-) -> Optional[PlacementStrategy]:
-    """Build the placement for ``cam``, filling in ``size`` from the
-    camera's aspect ratio when the YAML doesn't pin it. Width defaults
-    to 1.0 m so a 16:9 camera lands at 1.0 x 0.5625, a 3.55:1 SBS at
-    1.0 x 0.281."""
-    if spec is not None and "size" not in spec:
-        w = int(cam["width"])
-        h = int(cam["height"])
-        spec = {
-            **spec,
-            "size": [_DEFAULT_PLANE_WIDTH_M, _DEFAULT_PLANE_WIDTH_M * h / w],
-        }
-    return _build_placement(spec, is_xr)
-
-
-def _stereo_for(cam: dict, placements_cfg: dict) -> Tuple[bool, float]:
-    """``cameras.<cam>.stereo`` (producer toggle) + ``placements.<cam>.stereo_baseline_mm``."""
-    stereo = bool(cam.get("stereo", False))
-    pspec = placements_cfg.get(cam["name"]) or {}
-    baseline_mm = float(pspec.get("stereo_baseline_mm", 0.0))
-    return stereo, baseline_mm
-
-
-def _build_local_entries(cfg: dict, is_xr: bool) -> List[SourceEntry]:
-    """source=local: open each enabled camera directly."""
-    placements_cfg = cfg.get("display", {}).get("placements", {})
-    entries: List[SourceEntry] = []
-    for cam in _enabled_cameras(cfg):
-        placement = _placement_with_aspect(placements_cfg.get(cam["name"]), cam, is_xr)
-        stereo, baseline_mm = _stereo_for(cam, placements_cfg)
-        for source in build_local_camera(cam):
-            entries.append(
-                SourceEntry(
-                    source=source,
-                    placement=placement,
-                    stereo=stereo,
-                    stereo_baseline_mm=baseline_mm,
-                )
-            )
-    return entries
-
-
-def _build_rtp_entries(cfg: dict, is_xr: bool) -> List[SourceEntry]:
-    """One RTP listener per camera; stereo uses rtp.port + rtp.port_right
-    and pairs them at the receiver (no wire-level sync — drift OK)."""
-    placements_cfg = cfg.get("display", {}).get("placements", {})
-    entries: List[SourceEntry] = []
-    for cam in _enabled_cameras(cfg):
-        rtp = cam.get("rtp", {})
-        if "port" not in rtp:
-            raise ValueError(
-                f"camera_viz: camera {cam.get('name')!r} missing rtp.port; "
-                "required when source: rtp"
-            )
-        placement = _placement_with_aspect(placements_cfg.get(cam["name"]), cam, is_xr)
-        stereo, baseline_mm = _stereo_for(cam, placements_cfg)
-
-        if stereo:
-            if "port_right" not in rtp:
-                raise ValueError(
-                    f"camera_viz: stereo camera {cam.get('name')!r} missing "
-                    "rtp.port_right (required when stereo + source: rtp)"
-                )
-            left = RtpH264Source(
-                name=f"{cam['name']}.left",
-                width=int(cam["width"]),
-                height=int(cam["height"]),
-                port=int(rtp["port"]),
-                rtp_buffer_size=int(rtp.get("rtp_buffer_size", 212992)),
-                gpu_id=int(rtp.get("gpu_id", 0)),
-            )
-            right = RtpH264Source(
-                name=f"{cam['name']}.right",
-                width=int(cam["width"]),
-                height=int(cam["height"]),
-                port=int(rtp["port_right"]),
-                rtp_buffer_size=int(rtp.get("rtp_buffer_size", 212992)),
-                gpu_id=int(rtp.get("gpu_id", 0)),
-            )
-            source: FrameSource = PairedFrameSource(
-                name=cam["name"], left=left, right=right
-            )
-        else:
-            source = RtpH264Source(
-                name=cam["name"],
-                width=int(cam["width"]),
-                height=int(cam["height"]),
-                port=int(rtp["port"]),
-                rtp_buffer_size=int(rtp.get("rtp_buffer_size", 212992)),
-                gpu_id=int(rtp.get("gpu_id", 0)),
-            )
-
-        entries.append(
-            SourceEntry(
-                source=source,
-                placement=placement,
-                stereo=stereo,
-                stereo_baseline_mm=baseline_mm,
-            )
-        )
-    return entries
-
-
-def _make_session(cfg: dict, mode_override: Optional[str] = None) -> viz.VizSession:
-    display = cfg.get("display", {})
-    # --mode overrides display.mode when given.
-    mode_str = (mode_override or display.get("mode", "window")).lower()
-    session_cfg = viz.VizSessionConfig()
-    if mode_str == "window":
-        session_cfg.mode = viz.DisplayMode.kWindow
-        w = display.get("window", {})
-        session_cfg.window_width = int(w.get("width", 1280))
-        session_cfg.window_height = int(w.get("height", 720))
-    elif mode_str == "xr":
-        session_cfg.mode = viz.DisplayMode.kXr
-        x = display.get("xr", {})
-        session_cfg.xr_near_z = float(x.get("near_z", 0.05))
-        session_cfg.xr_far_z = float(x.get("far_z", 100.0))
-    else:
-        raise ValueError(
-            f"camera_viz: display.mode must be window|xr, got {mode_str!r}"
-        )
-    if "clear_color" in display:
-        session_cfg.clear_color = tuple(display["clear_color"])
-    session_cfg.app_name = display.get("app_name", "camera_viz")
-    return viz.VizSession.create(session_cfg)
-
-
-def main(argv: Optional[list[str]] = None) -> int:
+def _parse_args(argv: Optional[list[str]]):
     parser = argparse.ArgumentParser(description="Televiz camera_viz — display side")
     parser.add_argument("config", type=Path, help="YAML config file")
     parser.add_argument(
         "--mode",
         choices=("window", "xr"),
         default=None,
-        help="Override display.mode from the config (default: use the config's value).",
+        help="Override display.mode from the config "
+        "(default: the config's value, or xr when the config omits it).",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "--xr-wait",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Override display.xr.system_wait_seconds: how long to wait for the "
+        "headset to connect. Negative waits forever (the default); 0 fails fast.",
+    )
+    CloudXRLauncher.add_launcher_arguments(parser)
+    return parser.parse_args(argv)
+
+
+def _build_display(session, entries, switch_shapes: bool):
+    """Parallel arrays, one entry per camera stream.
+
+    They stay parallel because the controls mutate them in place: a shape
+    switch rewrites ``layers[i]`` and a lock-mode change ``strategies[i]``,
+    and the runner reads the same lists.
+    """
+    sources, layers, strategies, shape_layers = [], [], [], []
+    for entry in entries:
+        per_shape = display.add_layers(session, entry, switch_shapes)
+        sources.append(entry.source)
+        shape_layers.append(per_shape)
+        layers.append(per_shape[entry.shape])
+        # Lock-mode strategies reposition quads AND cylinders (the runner
+        # adapts the pose to the cylinder's head-anchored center). An
+        # equirect sphere is centred on the operator with nothing to
+        # re-snap, so the runner skips it by layer type -- the strategy is
+        # still kept here, because switching away from equirect needs it.
+        strategies.append(entry.placement)
+    return sources, layers, strategies, shape_layers
+
+
+def _build_controls(
+    session, entries, layers, shape_layers, strategies, controls_cfg, dashboard
+):
+    """Wire the XR controller bindings to the layers they drive.
+
+    ``strategies`` is handed over as-is rather than copied: the controls swap
+    entries in place on a lock-mode change and the runner reads the same list.
+    """
+    targets = [
+        ControlTarget(
+            name=e.source.spec.name,
+            layer=layer,
+            shape=e.shape,
+            stereo=e.stereo,
+            plane_distance_cm=e.stereo_plane_distance_cm,
+            lock_mode=e.lock_mode,
+            placement_config=e.placement_config,
+            shape_layers=per_shape,
+            cylinder_radius_m=e.cylinder_radius_m,
+            cylinder_angle_deg=e.cylinder_angle_deg,
+            equirect_yaw_deg=e.equirect_yaw_deg,
+        )
+        for e, layer, per_shape in zip(entries, layers, shape_layers)
+    ]
+    # Added last so it composites over the feeds (insertion order is blend
+    # order for runtime-composited layers).
+    hud = make_hud(session, controls_cfg.hud)
+    return ControllerControls(
+        session,
+        targets,
+        strategies,
+        controls_cfg,
+        hud=hud,
+        # The panel owns stderr while it is live; a second writer there lands
+        # inside it and leaves every repaint misaligned.
+        log_to_stderr=not dashboard.live,
+    )
+
+
+def _render_extent_note(session, entries) -> List[str]:
+    """The per-eye extent the runtime asked us to render at.
+
+    This is the number that says whether a foveation
+    NV_CXR_RUNTIME_FOVEATION_UNWARPED_WIDTH override reached the app: the
+    runtime hands it back through xrEnumerateViewConfigurationViews. Shown
+    next to the widest source so the ratio is readable -- a feed wider than
+    the extent is being minified before it is ever encoded, which is what
+    aliases.
+    """
+    get = getattr(session, "get_recommended_resolution", None)
+    if get is None:  # older isaaccapture wheel
+        return []
+    try:
+        resolution = get()
+        width, height = resolution.width, resolution.height
+    except Exception as exc:  # noqa: BLE001 -- a note must not be fatal...
+        # ...but it must not vanish either: swallowing this silently is why
+        # the line went missing when get_recommended_resolution turned out to
+        # return a Resolution rather than a tuple.
+        print(f"camera_viz: render extent unavailable: {exc!r}", file=sys.stderr)
+        return []
+    note = f"render extent {width}x{height} per eye"
+    widest = max((e.source.spec.width for e in entries), default=0)
+    if widest:
+        note += f"; widest source {widest} px ({width / widest:.2f}x)"
+    # Printed here as well as returned: this is the one number that says
+    # whether a foveation override reached the app, and the status panel
+    # shows it dimmed on its last line, where it is easy to miss and gone
+    # entirely if the run dies later in startup.
+    print(f"camera_viz: {note}", file=sys.stderr, flush=True)
+    return [note]
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _parse_args(argv)
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -225,70 +174,221 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Top-level ``verbose:`` enables per-source periodic breadcrumbs.
     set_verbose(bool(cfg.get("verbose", False)))
+    resolve_video_paths(cfg, args.config.parent)
 
     source_mode = cfg.get("source", "local").lower()
     if source_mode not in ("local", "rtp"):
         raise ValueError(f"camera_viz: source must be local|rtp, got {source_mode!r}")
 
-    effective_mode = (args.mode or cfg.get("display", {}).get("mode", "window")).lower()
-    session = _make_session(cfg, mode_override=args.mode)
-    is_xr = session.is_xr_mode()
+    effective_mode = (args.mode or cfg.get("display", {}).get("mode", "xr")).lower()
+    config.check_shapes_are_displayable(cfg, effective_mode)
 
-    if source_mode == "local":
-        entries = _build_local_entries(cfg, is_xr)
-    else:
-        entries = _build_rtp_entries(cfg, is_xr)
+    # CloudXR runtime settings (display.cloudxr) go through a generated
+    # --cloudxr-env-config file rather than os.environ: an env file is the one
+    # tier that outranks a stale `source ~/.cloudxr/run/cloudxr.env` in the
+    # shell, which otherwise beats both a setdefault here and the launcher's
+    # own --cloudxr-device-profile. See cloudxr_env for the rest of the
+    # reasoning. No effect under --no-launch-cloudxr-runtime: that runtime
+    # already started with whatever environment it was given.
+    cloudxr_settings = {}
+    if effective_mode == "xr":
+        cloudxr_settings = cloudxr_env.env_from_yaml(cfg.get("display", {}))
 
-    # Build sources, layers, and placement strategies in parallel arrays.
-    sources, layers, strategies = [], [], []
-    for entry in entries:
-        sources.append(entry.source)
-        layer_cfg = viz.QuadLayerConfig()
-        layer_cfg.name = entry.source.spec.name
-        layer_cfg.resolution = viz.Resolution(
-            entry.source.spec.width, entry.source.spec.height
-        )
-        layer_cfg.format = viz.PixelFormat.kRGBA8
-        if entry.stereo:
-            layer_cfg.stereo = True
-            layer_cfg.stereo_baseline_mm = entry.stereo_baseline_mm
-        layers.append(session.add_quad_layer(layer_cfg))
-        strategies.append(entry.placement)
-
-    print(
-        f"camera_viz: source={source_mode}, mode={effective_mode}, "
-        f"xr={is_xr}, {len(sources)} layer(s)",
-        flush=True,
-    )
-
-    runner = VizRunner(session, sources, layers, strategies)
-
-    def _on_signal(signum, frame):
-        print(f"camera_viz: stopping (signal {signum})...", flush=True)
-        runner.stop()
-
-    signal.signal(signal.SIGINT, _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
-
-    runner.start()
-    try:
-        runner.wait()
-    finally:
-        # Skip session.destroy() when a worker thread is still alive —
-        # it may be inside session.render() and destroying under it
-        # would UAF on the Vulkan / CUDA handles. Non-daemon thread
-        # keeps the process alive; OS reaps at exit.
-        clean = runner.stop()
-        if clean:
-            session.destroy()
-        else:
+    # In XR mode, launch the in-process CloudXR runtime (+ WSS proxy for
+    # headset clients) before creating the session — VizSession's OpenXR
+    # instance needs XR_RUNTIME_JSON + a running service, both of which the
+    # launcher provides. --no-launch-cloudxr-runtime skips this when a
+    # runtime is already up (e.g. after sourcing ~/.cloudxr/run/cloudxr.env).
+    # Window mode never launches a runtime.
+    # Entered manually (not ``with``) so the unclean-stop path below can
+    # SKIP the teardown: stopping the runtime while a worker thread is
+    # still inside session.render() would rip the OpenXR service out from
+    # under a live xrWaitFrame — the same hazard the skip-destroy
+    # mitigation exists for. The launcher registers an atexit stop, which
+    # fires once the stuck (non-daemon) thread finally exits.
+    settings_stack = contextlib.ExitStack()
+    if effective_mode == "xr" and not args.launch_cloudxr_runtime:
+        # Nothing is launched, so nothing carries these to the runtime that is
+        # already up -- it started with whatever environment it was given.
+        extra = set(cloudxr_settings) - set(cloudxr_env.DEFAULT_ENV)
+        if extra or cloudxr_settings != cloudxr_env.DEFAULT_ENV:
             print(
-                "camera_viz: worker thread did not exit; leaving VizSession "
-                "alive to avoid use-after-free. Process will keep running "
-                "until the stuck thread completes.",
+                "camera_viz: warning: display.cloudxr is ignored under "
+                "--no-launch-cloudxr-runtime; set those variables in the "
+                "environment of the runtime process instead",
                 file=sys.stderr,
                 flush=True,
             )
+    if effective_mode == "xr" and args.launch_cloudxr_runtime:
+        # An explicit --cloudxr-env-config is the operator overriding the
+        # config file; do not overwrite it with the generated one.
+        if getattr(args, "cloudxr_env_config", None) is None:
+            work_dir = Path(settings_stack.enter_context(tempfile.TemporaryDirectory()))
+            args.cloudxr_env_config = str(
+                cloudxr_env.write_env_file(cloudxr_settings, work_dir / "cloudxr.env")
+            )
+    # A null context, not the launcher's NoopContext: that landed after the
+    # isaaccapture this sample pins, and importing it would break the sample
+    # against its own wheel. Swap it in (and drop the None guard below) once
+    # the pin catches up.
+    launch_ctx = (
+        CloudXRLauncher.launch_context(args)
+        if effective_mode == "xr"
+        else contextlib.nullcontext(None)
+    )
+    launcher = launch_ctx.__enter__()
+    stop_launcher = True
+    try:
+        controls_cfg = controls_config_from_yaml(cfg.get("display", {}))
+        # Window mode has no controllers, so don't ask for their extensions.
+        want_controls = controls_cfg.enabled and effective_mode == "xr"
+        interrupt_signum = None
+
+        def _interrupt(signum, frame):
+            nonlocal interrupt_signum
+            interrupt_signum = signum
+            raise KeyboardInterrupt
+
+        # Before create(): native HMD wait only sees Ctrl-C if a Python handler is pending.
+        signal.signal(signal.SIGINT, _interrupt)
+        signal.signal(signal.SIGTERM, _interrupt)
+
+        try:
+            session = display.make_session(
+                cfg,
+                mode_override=args.mode,
+                required_extensions=(
+                    ControllerControls.required_extensions() if want_controls else None
+                ),
+                xr_wait_override=args.xr_wait,
+            )
+        except KeyboardInterrupt:
+            n = signal.SIGINT if interrupt_signum is None else interrupt_signum
+            print(f"camera_viz: stopping (signal {n})...", flush=True)
+            return 0
+        is_xr = session.is_xr_mode()
+
+        if source_mode == "local":
+            entries = config.build_local_entries(cfg, is_xr)
+        else:
+            entries = config.build_rtp_entries(cfg, is_xr)
+
+        # Shape switching needs every shape resident, and the shaped layers
+        # are XR-only, so it is off outside XR regardless of the config.
+        switch_shapes = want_controls and is_xr and controls_cfg.shape_switching
+
+        sources, layers, strategies, shape_layers = _build_display(
+            session, entries, switch_shapes
+        )
+
+        cameras = f"{len(sources)} camera" + ("s" if len(sources) != 1 else "")
+        header = f"{effective_mode} · {source_mode} · {cameras}"
+        notes = _render_extent_note(session, entries) if is_xr else []
+        if switch_shapes:
+            extra = sum(
+                display.estimate_layer_bytes(e, shape)
+                for e in entries
+                for shape in config.VALID_SHAPES
+                if shape != e.shape
+            )
+            notes.append(
+                f"shape switching on — {len(config.VALID_SHAPES) - 1} extra layer(s) per "
+                f"camera, about {extra / (1024 * 1024):.0f} MiB additional VRAM"
+            )
+
+        # Built before the controls and the sources' notifications are
+        # rerouted: while it is live it owns stderr, and a second writer on
+        # that stream lands inside the panel (see Dashboard.note).
+        dashboard = Dashboard()
+        if dashboard.live:
+            set_notify_sink(dashboard.note)
+            # The console handler writes to the stderr this panel owns, so
+            # routine chatter mid-repaint leaves its line count wrong for the
+            # rest of the run. Raised, not silenced: a warning is worth a torn
+            # panel, and the log file keeps every level either way.
+            logging_config.set_console_level("warning")
+        else:
+            # Nothing is redrawing, so the header would never be seen.
+            print(f"camera_viz: {header}", flush=True)
+            for note in notes:
+                print(f"camera_viz: {note}", file=sys.stderr, flush=True)
+
+        controls = (
+            _build_controls(
+                session,
+                entries,
+                layers,
+                shape_layers,
+                strategies,
+                controls_cfg,
+                dashboard,
+            )
+            if want_controls and is_xr
+            else None
+        )
+
+        runner = VizRunner(
+            session,
+            sources,
+            layers,
+            strategies,
+            controls=controls,
+            dashboard=dashboard,
+            header=header,
+            notes=notes,
+        )
+
+        def _on_signal(signum, frame):
+            print(f"camera_viz: stopping (signal {signum})...", flush=True)
+            runner.stop()
+
+        signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
+
+        # Entered manually rather than with ``with``: teardown is ordered and
+        # conditional. The controls' trackers borrow the XrInstance / XrSession
+        # that VizSession owns, so they must detach AFTER the render thread
+        # stops polling them but BEFORE destroy() frees those handles — and
+        # neither may happen at all if a worker thread is still alive.
+        if controls is not None:
+            controls.__enter__()
+        runner.start()
+        try:
+            runner.wait(
+                health_check=launcher.health_check if launcher is not None else None
+            )
+        finally:
+            # Skip destroy() when a worker thread is still alive — it may be
+            # inside session.render() and destroying under it would UAF on the
+            # Vulkan / CUDA handles. Non-daemon thread keeps the process alive;
+            # OS reaps at exit. Leave the CloudXR runtime up too (see the
+            # launch_ctx comment above).
+            clean = runner.stop()
+            # Unhook first: a source thread that outlives stop() would
+            # otherwise notify into a panel that has closed.
+            set_notify_sink(None)
+            dashboard.close()
+            if clean:
+                if controls is not None:
+                    controls.__exit__(None, None, None)
+                session.destroy()
+            else:
+                stop_launcher = False
+                print(
+                    "camera_viz: worker thread did not exit; leaving VizSession, "
+                    "the controller session and the CloudXR runtime alive to "
+                    "avoid use-after-free. Process will keep running until the "
+                    "stuck thread completes.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    finally:
+        if stop_launcher:
+            launch_ctx.__exit__(None, None, None)
+        # Held open until here: the launcher reads the generated env file at
+        # launch, and keeping it on disk for the run makes the settings
+        # actually in force inspectable while the runtime is up.
+        settings_stack.close()
     return 0
 
 

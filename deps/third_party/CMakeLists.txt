@@ -99,6 +99,45 @@ FetchContent_MakeAvailable(flatbuffers)
 message(STATUS "FlatBuffers fetched and configured")
 
 # ==============================================================================
+# spdlog (C++ logging library)
+# ==============================================================================
+# Backs isaaccapture::Logger (src/core/log_bridge). Needed by standalone plugin
+# executables regardless of BUILD_PYTHON_BINDINGS, so fetched unconditionally
+# like FlatBuffers/MCAP rather than gated.
+message(STATUS "Fetching spdlog from GitHub...")
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG        79524ddd08a4ec981b7fea76afd08ee05f83755d  # v1.17.0
+    GIT_SHALLOW    FALSE  # Need full history for this specific commit
+)
+set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "Skip spdlog examples" FORCE)
+set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "Skip spdlog tests" FORCE)
+set(SPDLOG_INSTALL OFF CACHE BOOL "Skip spdlog install target" FORCE)
+# DepthAI calls find_package(spdlog CONFIG REQUIRED) itself, which silently
+# returns using the targets defined here, so it ends up compiled against *this*
+# spdlog. vcpkg's spdlog port is built with SPDLOG_FMT_EXTERNAL=ON and ships no
+# bundled fmt, and the bundled headers carry the upstream include guards, so
+# mixing the two leaves DepthAI's translation units seeing different spdlog/fmt
+# types than ours were compiled with. Pointing at the vcpkg fmt leaves one fmt
+# in the build.
+#
+# Set in both directions, because FORCE writes the cache: setting it only in the
+# ON branch left an earlier -DBUILD_PLUGIN_OAK_CAMERA=ON standing in a build
+# directory reconfigured with the option off.
+if(BUILD_PLUGIN_OAK_CAMERA)
+    # Explicit, though spdlog would find_package(fmt) on its own: a missing fmt
+    # should fail here, naming this as the reason, not inside spdlog's build.
+    find_package(fmt CONFIG REQUIRED)
+    set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "Share DepthAI's vcpkg fmt" FORCE)
+    message(STATUS "spdlog will use the external (vcpkg) fmt, shared with DepthAI")
+else()
+    set(SPDLOG_FMT_EXTERNAL OFF CACHE BOOL "Use spdlog's bundled fmt" FORCE)
+endif()
+FetchContent_MakeAvailable(spdlog)
+message(STATUS "spdlog v1.17.0 fetched")
+
+# ==============================================================================
 # Catch2 (Testing Framework)
 # ==============================================================================
 # Catch2 is a modern, C++-native, test framework for unit tests.
@@ -202,3 +241,58 @@ if(BUILD_VIZ)
     FetchContent_MakeAvailable(glfw)
     message(STATUS "GLFW 3.4 fetched")
 endif()
+
+# ==============================================================================
+# MuJoCo (robot twin scene + renderer)
+# ==============================================================================
+# Built from upstream sources unmodified and shipped under a private name, so the robot
+# twin's MuJoCo is an implementation detail nothing else in the process can see.
+# Mujoco.cmake beside this file is that contract and the function consumers reach it
+# through; src/viz/robot_twin is the only consumer.
+#
+# Upstream builds one library -- engine, renderer, MJCF parser -- with no renderer-only
+# target, so this is the whole of it even though the twin calls no dynamics.
+# src/viz/robot_twin is the only consumer and it is a pybind11 extension, so a build
+# without the bindings has nothing to link this to.
+if(BUILD_VIZ AND BUILD_PYTHON_BINDINGS)
+    message(STATUS "Fetching MuJoCo from GitHub...")
+    FetchContent_Declare(
+        mujoco
+        GIT_REPOSITORY https://github.com/google-deepmind/mujoco.git
+        GIT_TAG        3.11.0
+        GIT_SHALLOW    TRUE
+    )
+
+    # Before MakeAvailable, which is what runs MuJoCo's own CMakeLists -- so these cannot
+    # move into Mujoco.cmake below. Plain variables, not the `CACHE ... FORCE` the entries
+    # above use: MuJoCo sets CMAKE_POLICY_DEFAULT_CMP0077 NEW before its own project(), so
+    # a normal variable wins over its option() and leaves no knob in the cache. Turning the
+    # tests off is what keeps abseil, googletest and benchmark out of _deps.
+    set(MUJOCO_BUILD_EXAMPLES OFF)
+    set(MUJOCO_BUILD_SIMULATE OFF)
+    set(MUJOCO_BUILD_TESTS OFF)
+    set(MUJOCO_TEST_PYTHON_UTIL OFF)
+
+    FetchContent_MakeAvailable(mujoco)
+    message(STATUS "MuJoCo 3.11.0 fetched")
+
+    include("${CMAKE_CURRENT_LIST_DIR}/Mujoco.cmake")
+endif()
+
+# ==============================================================================
+# Chromium physical key table (vendored source, BSD-3-Clause; see chromium/README.md)
+# ==============================================================================
+# Header-only: consumers write <chromium/dom_code_data.inc>.
+add_library(chromium_dom_codes INTERFACE)
+target_include_directories(chromium_dom_codes INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/chromium/include)
+add_library(third_party::chromium_dom_codes ALIAS chromium_dom_codes)
+
+# Binary redistributions of the table must carry Chromium's notice: copies its LICENSE next to
+# `target`'s output as CHROMIUM_LICENSE after each build.
+function(chromium_dom_codes_stage_license target)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/chromium/LICENSE"
+                "$<TARGET_FILE_DIR:${target}>/CHROMIUM_LICENSE"
+        COMMENT "Staging Chromium's LICENSE beside $<TARGET_FILE_NAME:${target}>")
+endfunction()
